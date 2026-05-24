@@ -945,6 +945,48 @@ class QKVParallelLinear(ColumnParallelLinear):
             disable_tp=disable_tp,
         )
 
+    def forward_split(
+        self, input_: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return Q, K, V as contiguous tensors via three separate matmuls.
+
+        Head-grouped paging's decode fast path merges dim 0 and dim 1
+        with a single ``.view()``, which needs contiguous inputs. The
+        fused ``forward() + .split()`` would yield wider-stride slices,
+        so split the matmul instead. ``self.weight`` is row-major, so
+        the row slices are themselves contiguous — no extra copies. The
+        cost is two extra GEMM launches per layer. Unquantized only.
+        """
+        # Quantized methods may pack/permute the output dim and break
+        # the row-slice contract.
+        assert isinstance(self.quant_method, UnquantizedLinearMethod), (
+            "QKVParallelLinear.forward_split requires unquantized weights; "
+            f"got {type(self.quant_method).__name__}."
+        )
+        assert not self.gather_output or self.tp_size == 1, (
+            "QKVParallelLinear.forward_split does not implement output "
+            "all-gather; head-grouped paging operates per-rank."
+        )
+
+        weight = self.weight
+        q_size = self.num_heads * self.head_size
+        kv_size = self.num_kv_heads * self.head_size
+        w_q = weight[:q_size]
+        w_k = weight[q_size : q_size + kv_size]
+        w_v = weight[q_size + kv_size :]
+
+        if self.bias is not None and not self.skip_bias_add:
+            b_q = self.bias[:q_size]
+            b_k = self.bias[q_size : q_size + kv_size]
+            b_v = self.bias[q_size + kv_size :]
+        else:
+            b_q = b_k = b_v = None
+
+        q = torch.nn.functional.linear(input_, w_q, b_q)
+        k = torch.nn.functional.linear(input_, w_k, b_k)
+        v = torch.nn.functional.linear(input_, w_v, b_v)
+        return q, k, v
+
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
             "q": 0,

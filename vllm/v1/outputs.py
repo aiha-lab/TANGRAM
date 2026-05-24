@@ -181,6 +181,14 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # Compression results; populated only on steps that ran compression.
+    compression_new_eff_seq_lens: dict[str, list[int]] | None = None
+    """req_id → per-head-group-total int list of post-compression cache
+    occupancy (mirrors ``input_batch.effective_seq_lens_cpu[row, :]``)."""
+    compression_freed_block_ids: np.ndarray | None = None
+    """int32 ndarray of physical block ids freed by compression (sorted +
+    deduplicated). Routed through ``KVCacheManager.free_blocks_by_ids``."""
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

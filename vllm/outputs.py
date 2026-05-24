@@ -121,6 +121,7 @@ class RequestOutput:
         *,
         multi_modal_placeholders: MultiModalPlaceholderDict | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        turn_output_token_ids: list[list[int]] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -142,6 +143,10 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        # Multi-turn: per-turn output token ids on the final
+        # ``RequestOutput`` of a multi-turn request; ``None`` for
+        # single-turn requests.
+        self.turn_output_token_ids = turn_output_token_ids
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""

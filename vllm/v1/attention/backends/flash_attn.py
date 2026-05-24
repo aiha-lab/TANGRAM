@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashAttention."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from typing import ClassVar
 
 import numpy as np
@@ -48,7 +48,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, HeadGroupedAttentionSpec
 
 logger = init_logger(__name__)
 
@@ -216,6 +216,34 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
+    # Head-grouped paging fields. Inactive when
+    # ``num_head_groups_per_layer == 0``; layout selected by
+    # ``head_grouped_decode_layout``:
+    #
+    #   False (prefill / mixed) — group-major:
+    #     block_table_grouped  [num_head_groups_total, num_reqs, max_blocks]
+    #     seq_lens_grouped     [num_head_groups_total, num_reqs]
+    #     slot_mapping_grouped [num_head_groups_total, num_actual_tokens]
+    #     Per-layer slice ``[L*n : (L+1)*n]`` flattens to varlen.
+    #
+    #   True (uniform decode, ``max_query_len == 1``) — req-major with
+    #   added layer axis so ``[L]`` is a pure view:
+    #     block_table_grouped  [num_layers, num_reqs, n_per_layer, max_blocks]
+    #     seq_lens_grouped     [num_layers, num_reqs, n_per_layer]
+    #     slot_mapping_grouped [num_layers, num_reqs, n_per_layer]
+    num_head_groups_per_layer: int = 0
+    block_table_grouped: torch.Tensor | None = None
+    seq_lens_grouped: torch.Tensor | None = None
+    slot_mapping_grouped: torch.Tensor | None = None
+    # cu_seqlens for the (n_per_layer × num_reqs) virtual sequences per
+    # layer; shape ``[n_per_layer × num_reqs + 1]``.
+    query_start_loc_grouped: torch.Tensor | None = None
+    head_grouped_decode_layout: bool = False
+    # Per-layer ``FlashAttentionMetadata`` overlays for the decode fast
+    # path; pre-built so attention avoids ``dataclass_replace`` in the
+    # hot loop.
+    per_layer_md: list | None = None
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -277,6 +305,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
+        # Head-grouped paging disables AOT scheduling because each layer
+        # sees ``num_groups × num_reqs`` virtual sequences, which AOT did
+        # not precompute against.
+        if isinstance(kv_cache_spec, HeadGroupedAttentionSpec):
+            self.aot_schedule = False
 
         try:
             from vllm.distributed.parallel_state import get_dcp_group
@@ -296,6 +329,17 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
+
+        # Head-grouped paging adds group-major views to the base metadata;
+        # the per-layer slice happens in ``Attention.forward``.
+        self._head_grouped = isinstance(kv_cache_spec, HeadGroupedAttentionSpec)
+        if self._head_grouped:
+            assert isinstance(kv_cache_spec, HeadGroupedAttentionSpec)
+            self._num_head_groups_per_layer = (
+                kv_cache_spec.num_head_groups_per_layer
+            )
+        else:
+            self._num_head_groups_per_layer = 0
 
         if self.use_full_cuda_graph and self.aot_schedule:
             self.scheduler_metadata = torch.zeros(
@@ -470,6 +514,147 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        # Precompute per-step views consumed by
+        # ``Attention._forward_head_grouped``; layout selected by
+        # ``head_grouped_decode_layout``.
+        head_grouped_decode_layout = False
+        if self._head_grouped:
+            assert block_table_tensor.ndim == 3, (
+                "head-grouped path expects 3D block_table_tensor "
+                "[num_reqs, num_head_groups_total, max_blocks_per_req], "
+                f"got shape {tuple(block_table_tensor.shape)}.")
+            num_head_groups_total = block_table_tensor.shape[1]
+            n_per_layer = self._num_head_groups_per_layer
+            assert num_head_groups_total % n_per_layer == 0, (
+                f"num_head_groups_total ({num_head_groups_total}) is not "
+                f"divisible by num_head_groups_per_layer ({n_per_layer}).")
+            num_layers_local = num_head_groups_total // n_per_layer
+            assert slot_mapping.ndim == 2, (
+                "head-grouped path expects 2D slot_mapping "
+                "[num_head_groups_total, num_actual_tokens], "
+                f"got shape {tuple(slot_mapping.shape)}.")
+            effective_seq_lens_cpu = (
+                common_attn_metadata.effective_seq_lens_cpu)
+            head_grouped_decode_layout = max_query_len == 1
+
+            if head_grouped_decode_layout:
+                # Uniform decode: every (req, group) varlen sequence has
+                # length 1 so num_actual_tokens == num_reqs.
+                assert num_actual_tokens == num_reqs, (
+                    "uniform-decode head-grouped path expects "
+                    f"num_actual_tokens ({num_actual_tokens}) == num_reqs "
+                    f"({num_reqs})."
+                )
+                # [num_reqs, num_groups_total, max_blocks]
+                # → [num_layers, num_reqs, n_per_layer, max_blocks]
+                block_table_grouped = (
+                    block_table_tensor
+                    .view(num_reqs, num_layers_local, n_per_layer, -1)
+                    .permute(1, 0, 2, 3)
+                    .contiguous()
+                )
+                # [num_groups_total, num_reqs] as
+                # [num_layers, n_per_layer, num_reqs]
+                # → [num_layers, num_reqs, n_per_layer]
+                slot_mapping_grouped = (
+                    slot_mapping
+                    .view(num_layers_local, n_per_layer, num_reqs)
+                    .permute(0, 2, 1)
+                    .contiguous()
+                )
+                if effective_seq_lens_cpu is not None:
+                    # seq_lens_grouped[layer, req, group] =
+                    #   effective[req, layer*n + group] + num_scheduled[req]
+                    query_start_loc_cpu = (
+                        common_attn_metadata.query_start_loc_cpu[
+                            : num_reqs + 1])
+                    num_scheduled_np = (
+                        query_start_loc_cpu[1:].cpu().numpy()
+                        - query_start_loc_cpu[:-1].cpu().numpy()
+                    )
+                    effective_np = np.asarray(
+                        effective_seq_lens_cpu, dtype=np.int32)[:num_reqs]
+                    effective_np = effective_np.reshape(
+                        num_reqs, num_layers_local, n_per_layer
+                    )
+                    seq_lens_grouped_np = (
+                        effective_np
+                        + num_scheduled_np.astype(np.int32)[:, None, None]
+                    ).transpose(1, 0, 2).copy()
+                    seq_lens_grouped = torch.from_numpy(
+                        seq_lens_grouped_np).to(seq_lens.device)
+                else:
+                    seq_lens_grouped = (
+                        seq_lens.view(1, num_reqs, 1)
+                        .expand(num_layers_local, num_reqs, n_per_layer)
+                        .contiguous()
+                    )
+                # Every sequence has length 1, so cu_seqlens is
+                # ``[0, 1, ..., n_per_layer × num_reqs]``.
+                query_start_loc_grouped = torch.arange(
+                    n_per_layer * num_reqs + 1,
+                    device=query_start_loc.device,
+                    dtype=query_start_loc.dtype,
+                )
+            else:
+                # Group-major path: the data copy is required because
+                # (req, group) sequences are not contiguous in any view
+                # of token-major Q when sequence lengths vary.
+                block_table_grouped = (
+                    block_table_tensor.permute(1, 0, 2).contiguous()
+                )
+                if effective_seq_lens_cpu is not None:
+                    # Cache holds effective[group] post-compression tokens
+                    # plus this step's chunk:
+                    # seq_lens_grouped[group, req] =
+                    #   effective[req, group] + num_scheduled[req]
+                    query_start_loc_cpu = (
+                        common_attn_metadata.query_start_loc_cpu[
+                            : num_reqs + 1])
+                    num_scheduled_np = (
+                        query_start_loc_cpu[1:].cpu().numpy()
+                        - query_start_loc_cpu[:-1].cpu().numpy()
+                    )
+                    effective_np = np.asarray(
+                        effective_seq_lens_cpu, dtype=np.int32)
+                    seq_lens_grouped_np = (
+                        effective_np[:num_reqs].T.astype(np.int32)
+                        + num_scheduled_np.astype(np.int32)[None, :]
+                    )
+                    seq_lens_grouped = torch.from_numpy(
+                        seq_lens_grouped_np).to(seq_lens.device).contiguous()
+                else:
+                    seq_lens_grouped = (
+                        seq_lens.unsqueeze(0)
+                        .expand(num_head_groups_total, -1)
+                        .contiguous()
+                    )
+                slot_mapping_grouped = slot_mapping
+                # cu_seqlens for the (n_per_layer × num_reqs) virtual
+                # sequences per layer; the layer slice happens in
+                # ``Attention._forward_head_grouped``.
+                query_start_head = query_start_loc[:num_reqs]
+                offsets = torch.arange(
+                    n_per_layer,
+                    device=query_start_head.device,
+                    dtype=query_start_head.dtype,
+                ) * num_actual_tokens
+                query_start_grouped_head = (
+                    query_start_head.unsqueeze(0) + offsets.unsqueeze(1)
+                ).reshape(-1)
+                query_start_grouped_tail = torch.tensor(
+                    [n_per_layer * num_actual_tokens],
+                    device=query_start_head.device,
+                    dtype=query_start_head.dtype,
+                )
+                query_start_loc_grouped = torch.cat(
+                    [query_start_grouped_head, query_start_grouped_tail])
+        else:
+            block_table_grouped = None
+            seq_lens_grouped = None
+            slot_mapping_grouped = None
+            query_start_loc_grouped = None
+
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -489,7 +674,31 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
+            num_head_groups_per_layer=self._num_head_groups_per_layer,
+            block_table_grouped=block_table_grouped,
+            seq_lens_grouped=seq_lens_grouped,
+            slot_mapping_grouped=slot_mapping_grouped,
+            query_start_loc_grouped=query_start_loc_grouped,
+            head_grouped_decode_layout=head_grouped_decode_layout,
         )
+        if head_grouped_decode_layout:
+            # Pre-build per-layer overlays so the attention layer picks
+            # the right metadata with a single list lookup.
+            n_per_layer = self._num_head_groups_per_layer
+            num_virtual_seqs = num_reqs * n_per_layer
+            attn_metadata.per_layer_md = [
+                dataclass_replace(
+                    attn_metadata,
+                    num_actual_tokens=num_virtual_seqs,
+                    block_table=block_table_grouped[layer_idx].view(
+                        num_virtual_seqs, -1),
+                    seq_lens=seq_lens_grouped[layer_idx].view(
+                        num_virtual_seqs),
+                    slot_mapping=slot_mapping_grouped[layer_idx].reshape(-1),
+                    query_start_loc=query_start_loc_grouped,
+                )
+                for layer_idx in range(num_layers_local)
+            ]
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:

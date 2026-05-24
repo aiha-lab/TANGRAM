@@ -3,8 +3,10 @@
 
 import itertools
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, overload
+
+import numpy as np
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -40,13 +42,44 @@ class KVCacheBlocks:
       (a precomputed KVCacheBlocks is in KVCacheManager to avoid GC overhead)
     """
 
+    block_ids_array: tuple[np.ndarray, ...] | None = field(default=None)
+    """
+    Head-grouped fast path: int32 block-id ndarrays (one per kv_cache_group)
+    in allocation order. When present, this is the source of truth for
+    ``get_block_ids`` / ``__add__`` / ``new_empty``, and ``blocks`` is
+    kept empty. Bypasses ``list[KVCacheBlock]`` materialisation.
+    """
+
     def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
-        """Adds two KVCacheBlocks instances."""
-        return KVCacheBlocks(
-            tuple(
-                list(itertools.chain(blk1, blk2))
-                for blk1, blk2 in zip(self.blocks, other.blocks)
+        """Concatenate two ``KVCacheBlocks`` per group.
+
+        If either operand uses the head-grouped fast path, both sides are
+        promoted to ndarray; otherwise concatenates the object lists.
+        """
+        if self.block_ids_array is None and other.block_ids_array is None:
+            return KVCacheBlocks(
+                tuple(
+                    list(itertools.chain(blk1, blk2))
+                    for blk1, blk2 in zip(self.blocks, other.blocks)
+                )
             )
+
+        def _ids_for(kvb: "KVCacheBlocks", i: int) -> np.ndarray:
+            if kvb.block_ids_array is not None:
+                return kvb.block_ids_array[i]
+            seq = kvb.blocks[i]
+            return np.fromiter(
+                (b.block_id for b in seq), dtype=np.int32, count=len(seq)
+            )
+
+        num_groups = max(len(self.blocks), len(other.blocks))
+        new_arrs = tuple(
+            np.concatenate([_ids_for(self, i), _ids_for(other, i)])
+            for i in range(num_groups)
+        )
+        return KVCacheBlocks(
+            blocks=tuple(() for _ in range(num_groups)),
+            block_ids_array=new_arrs,
         )
 
     @overload
@@ -74,19 +107,37 @@ class KVCacheBlocks:
                 - each inner list contains the block_ids of the blocks in that
                   group
         """
+        arrs = self.block_ids_array
+        if arrs is not None:
+            if allow_none and all(arr.size == 0 for arr in arrs):
+                return None
+            return tuple(arr.tolist() for arr in arrs)
         if allow_none and all(len(group) == 0 for group in self.blocks):
             return None
         return tuple([blk.block_id for blk in group] for group in self.blocks)
 
     def get_unhashed_block_ids(self) -> list[int]:
-        """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
+        """Get block_ids of unhashed blocks from KVCacheBlocks instance.
+
+        Not supported in head-grouped mode where prefix caching is disabled.
+        """
+        assert self.block_ids_array is None, (
+            "get_unhashed_block_ids is not supported on head-grouped fast "
+            "path (prefix caching is disabled).")
         assert len(self.blocks) == 1, "Only one group is supported"
-        return [block.block_id for block in self.blocks[0] if block.block_hash is None]
+        return [block.block_id for block in self.blocks[0]
+                if block.block_hash is None]
 
     def new_empty(self) -> "KVCacheBlocks":
-        """
-        Creates a new KVCacheBlocks instance with no blocks.
-        """
+        """Create an empty ``KVCacheBlocks`` mirroring this instance's mode."""
+        if self.block_ids_array is not None:
+            num_groups = len(self.block_ids_array)
+            return KVCacheBlocks(
+                blocks=tuple(() for _ in range(num_groups)),
+                block_ids_array=tuple(
+                    np.empty(0, dtype=np.int32) for _ in range(num_groups)
+                ),
+            )
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
 
 
@@ -141,15 +192,30 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
-
-        # Pre-constructed KVCacheBlocks with no blocks, callers should use this
-        # via create_kv_cache_blocks instead of creating new ones to avoid GC
-        # overhead.
-        #
-        # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
-        self.empty_kv_cache_blocks = KVCacheBlocks(
-            tuple(() for _ in range(self.num_kv_cache_groups))
+        # Head-grouped: any single-type manager in this mode flips the flag,
+        # so allocate / get_blocks return int32 ndarrays via
+        # ``KVCacheBlocks.block_ids_array``.
+        self.head_grouped = any(
+            getattr(m, "head_grouped", False)
+            for m in self.coordinator.single_type_managers
         )
+
+        # Pre-constructed empty KVCacheBlocks reused across callers to avoid
+        # GC overhead. In head-grouped mode mirror the ndarray fast path so
+        # ``empty + non_empty`` (used by KV connector) doesn't fall back to
+        # the object list.
+        if self.head_grouped:
+            self.empty_kv_cache_blocks = KVCacheBlocks(
+                blocks=tuple(() for _ in range(self.num_kv_cache_groups)),
+                block_ids_array=tuple(
+                    np.empty(0, dtype=np.int32)
+                    for _ in range(self.num_kv_cache_groups)
+                ),
+            )
+        else:
+            self.empty_kv_cache_blocks = KVCacheBlocks(
+                tuple(() for _ in range(self.num_kv_cache_groups))
+            )
 
     @property
     def usage(self) -> float:
@@ -223,6 +289,7 @@ class KVCacheManager:
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        effective_num_cached_tokens: int | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -280,10 +347,19 @@ class KVCacheManager:
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
         num_computed_tokens = request.num_computed_tokens + num_new_computed_tokens
-        num_tokens_need_slot = min(
-            num_computed_tokens + num_new_tokens + num_lookahead_tokens,
-            self.max_model_len,
-        )
+        # When compression has trimmed the cache, size the next allocation
+        # against post-compression occupancy rather than the model-side
+        # ``num_computed_tokens``. Pre-compression they coincide.
+        if effective_num_cached_tokens is not None:
+            num_tokens_need_slot = min(
+                effective_num_cached_tokens + num_new_tokens + num_lookahead_tokens,
+                self.max_model_len,
+            )
+        else:
+            num_tokens_need_slot = min(
+                num_computed_tokens + num_new_tokens + num_lookahead_tokens,
+                self.max_model_len,
+            )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
@@ -300,7 +376,10 @@ class KVCacheManager:
         if self.enable_caching:
             self.block_pool.touch(new_computed_block_list)
         else:
-            assert not any(new_computed_block_list), (
+            # In head-grouped mode every group is an empty tuple (prefix
+            # caching is disabled); use len() so we never call bool() on
+            # a possible ndarray.
+            assert not any(len(g) for g in new_computed_block_list), (
                 "Computed blocks should be empty when prefix caching is disabled"
             )
 
@@ -340,6 +419,18 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+
+    def free_blocks_by_ids(
+        self,
+        block_ids: "set[int] | np.ndarray",
+        candidate_req_ids: set[str] | None = None,
+    ) -> None:
+        """Compression callback: return the worker-reported dropped block
+        ids to the free queue. Accepts an int32 ndarray (head-grouped) or
+        a set[int]. ``candidate_req_ids`` narrows the per-request sweep to
+        this step's compressed requests.
+        """
+        self.coordinator.free_blocks_by_ids(block_ids, candidate_req_ids)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -413,7 +504,21 @@ class KVCacheManager:
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
-        self, blocks: tuple[list[KVCacheBlock], ...]
+        self,
+        blocks: tuple[list[KVCacheBlock] | np.ndarray, ...],
     ) -> KVCacheBlocks:
-        # Only create new KVCacheBlocks for non-empty blocks
+        """Wrap a coordinator result in ``KVCacheBlocks``.
+
+        Head-grouped: per-group payload is an int32 ndarray, routed through
+        ``block_ids_array``. Base path: ``list[KVCacheBlock]``. Payload
+        kinds are not mixed within a call.
+        """
+        if self.head_grouped:
+            # ``.size`` instead of bool() to avoid ndarray truthiness errors.
+            if not any(arr.size for arr in blocks):
+                return self.empty_kv_cache_blocks
+            return KVCacheBlocks(
+                blocks=tuple(() for _ in blocks),
+                block_ids_array=tuple(blocks),
+            )
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks

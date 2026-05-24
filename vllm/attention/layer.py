@@ -3,6 +3,7 @@
 """Attention layer."""
 
 from collections.abc import Callable
+from dataclasses import replace as dataclass_replace
 from typing import cast
 
 import torch
@@ -38,6 +39,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    HeadGroupedAttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -357,6 +359,38 @@ class Attention(nn.Module, AttentionLayerBase):
         ):
             self.query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
 
+        # Head-grouped paging derived sizes. ``page_group_size is None``
+        # turns the branch in ``forward()`` off and keeps this layer
+        # byte-identical to base vLLM.
+        self.page_group_size: int | None = None
+        self.num_groups_per_layer: int = 0
+        self.num_query_heads_per_group: int = num_heads
+        self.layer_idx: int = 0
+        if cache_config is not None and cache_config.page_group_size is not None:
+            self.page_group_size = cache_config.page_group_size
+            assert num_kv_heads % self.page_group_size == 0, (
+                f"num_kv_heads ({num_kv_heads}) is not divisible by "
+                f"page_group_size ({self.page_group_size})."
+            )
+            self.num_groups_per_layer = num_kv_heads // self.page_group_size
+            assert num_heads % self.num_groups_per_layer == 0, (
+                f"num_heads ({num_heads}) is not divisible by "
+                f"num_groups_per_layer ({self.num_groups_per_layer})."
+            )
+            self.num_query_heads_per_group = (
+                num_heads // self.num_groups_per_layer)
+            # ``models.utils`` imports model_loader → circular if hoisted.
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            try:
+                self.layer_idx = extract_layer_index(prefix)
+            except (AssertionError, ValueError) as exc:
+                raise ValueError(
+                    f"Could not extract a numeric layer index from layer "
+                    f"prefix {prefix!r}; head-grouped paging requires it for "
+                    f"per-layer metadata slicing."
+                ) from exc
+
     def forward(
         self,
         query: torch.Tensor,
@@ -390,6 +424,11 @@ class Attention(nn.Module, AttentionLayerBase):
             # check if query quantization is supported
             if self.impl.supports_quant_query_input():
                 query, _ = self.query_quant(query, self._q_scale)
+
+        # Head-grouped paging: reshape into group-major + slice per-layer
+        # metadata, then delegate to ``impl.forward``.
+        if self.num_groups_per_layer > 0:
+            return self._forward_head_grouped(query, key, value, output_shape)
 
         if self.use_output:
             output_shape = output_shape if output_shape is not None else query.shape
@@ -433,6 +472,159 @@ class Attention(nn.Module, AttentionLayerBase):
                     query, key, value, self.layer_name
                 )
 
+    def _forward_head_grouped(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output_shape: torch.Size | None,
+    ) -> torch.Tensor:
+        """Head-grouped forward: each (request, head-group) is one varlen
+        sequence. Decode uses a single ``.view()`` per Q/K/V/O against
+        precomputed per-layer metadata; prefill / mixed batches reshape
+        token-major → group-major to handle varying sequence lengths.
+        """
+        assert self.use_output, (
+            "Head-grouped paging requires backends that accept an output "
+            "buffer (FlashAttention does)."
+        )
+
+        num_groups = self.num_groups_per_layer
+        num_query_heads_per_group = self.num_query_heads_per_group
+        page_group_size = self.page_group_size
+        assert page_group_size is not None
+        head_size = self.head_size
+        num_heads = self.num_heads
+        num_kv_heads = self.num_kv_heads
+
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata[self.layer_name]
+        # Profiling run: no metadata; return a zero output.
+        if attn_metadata is None:
+            shape = output_shape if output_shape is not None else query.shape
+            return torch.zeros(shape, dtype=query.dtype, device=query.device)
+
+        assert (getattr(attn_metadata, "num_head_groups_per_layer", 0)
+                == num_groups), (
+            "FlashAttentionMetadata.num_head_groups_per_layer "
+            f"({getattr(attn_metadata, 'num_head_groups_per_layer', 0)}) "
+            f"does not match layer's num_groups_per_layer ({num_groups}).")
+
+        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+
+        if attn_metadata.head_grouped_decode_layout:
+            # Uniform-decode fast path: token-major Q/K/V flattens directly
+            # into group-major because every (req, group) sequence is one
+            # row. Per-layer metadata is precomputed by the builder, so we
+            # avoid the per-layer view/slice CPU dispatch cost called out
+            # in ``FlashAttentionImpl.forward``.
+            num_tokens = query.shape[0]
+            hidden = num_heads * head_size
+            q_grouped = query.view(
+                num_tokens * num_groups, num_query_heads_per_group, head_size)
+            k_grouped = key.view(
+                num_tokens * num_groups, page_group_size, head_size)
+            v_grouped = value.view(
+                num_tokens * num_groups, page_group_size, head_size)
+            output_token_major = torch.empty(
+                (num_tokens, hidden), dtype=query.dtype, device=query.device
+            )
+            output_grouped = output_token_major.view(
+                num_tokens * num_groups, num_query_heads_per_group, head_size)
+            layer_md = attn_metadata.per_layer_md[self.layer_idx]
+            self.impl.forward(
+                self, q_grouped, k_grouped, v_grouped,
+                self_kv_cache, layer_md, output=output_grouped,
+            )
+            if (output_shape is not None
+                    and tuple(output_shape) != (num_tokens, hidden)):
+                return output_token_major.view(output_shape)
+            return output_token_major
+
+        # Group-major path (prefill / mixed batches): a data copy is
+        # required because (req, group) sequences are not contiguous in
+        # any single view of token-major Q/K/V when sequence lengths vary.
+        q_token_major = query.view(-1, num_heads, head_size)
+        k_token_major = key.view(-1, num_kv_heads, head_size)
+        v_token_major = value.view(-1, num_kv_heads, head_size)
+        num_tokens = q_token_major.shape[0]
+
+        block_table_grouped = attn_metadata.block_table_grouped
+        seq_lens_grouped = attn_metadata.seq_lens_grouped
+        slot_mapping_grouped = attn_metadata.slot_mapping_grouped
+        query_start_loc_grouped = attn_metadata.query_start_loc_grouped
+        assert block_table_grouped is not None
+        assert seq_lens_grouped is not None
+        assert slot_mapping_grouped is not None
+        assert query_start_loc_grouped is not None
+
+        def to_group_major(
+            x: torch.Tensor, total_heads: int, sub_heads: int,
+        ) -> torch.Tensor:
+            # x: [num_tokens, total_heads, head_size]
+            return (
+                x.view(num_tokens, num_groups, sub_heads, head_size)
+                .permute(1, 0, 2, 3)
+                .contiguous()
+                .view(num_groups * num_tokens, sub_heads, head_size)
+            )
+
+        q_grouped = to_group_major(
+            q_token_major, num_heads, num_query_heads_per_group)
+        k_grouped = to_group_major(
+            k_token_major, num_kv_heads, page_group_size)
+        v_grouped = to_group_major(
+            v_token_major, num_kv_heads, page_group_size)
+
+        output_grouped = torch.empty(
+            (num_groups * num_tokens, num_query_heads_per_group, head_size),
+            dtype=query.dtype,
+            device=query.device,
+        )
+
+        # Slice the per-layer span of the group-major precomputes.
+        layer_start = self.layer_idx * num_groups
+        layer_end = layer_start + num_groups
+
+        num_reqs = seq_lens_grouped.shape[1]
+        block_table_layer = block_table_grouped[layer_start:layer_end].reshape(
+            num_groups * num_reqs, block_table_grouped.shape[-1]
+        )
+        seq_lens_layer = seq_lens_grouped[layer_start:layer_end].reshape(
+            num_groups * num_reqs)
+        slot_mapping_layer = slot_mapping_grouped[
+            layer_start:layer_end].reshape(-1)
+
+        layer_md = dataclass_replace(
+            attn_metadata,
+            num_actual_tokens=num_groups * num_tokens,
+            block_table=block_table_layer,
+            seq_lens=seq_lens_layer,
+            slot_mapping=slot_mapping_layer,
+            query_start_loc=query_start_loc_grouped,
+        )
+
+        self.impl.forward(
+            self, q_grouped, k_grouped, v_grouped,
+            self_kv_cache, layer_md, output=output_grouped,
+        )
+
+        # Inverse reshape: group-major → token-major hidden.
+        output_token_major = (
+            output_grouped.view(
+                num_groups, num_tokens,
+                num_query_heads_per_group, head_size)
+            .permute(1, 0, 2, 3)
+            .contiguous()
+            .view(num_tokens, num_heads * head_size)
+        )
+        if (output_shape is not None
+                and tuple(output_shape) != tuple(output_token_major.shape)):
+            output_token_major = output_token_major.view(output_shape)
+        return output_token_major
+
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
         self._k_scale.copy_(torch.abs(key).max() / self.k_range)
@@ -462,6 +654,20 @@ class Attention(nn.Module, AttentionLayerBase):
         block_size = vllm_config.cache_config.block_size
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
+        page_group_size = vllm_config.cache_config.page_group_size
+        if page_group_size is not None:
+            assert not vllm_config.model_config.use_mla, (
+                "MLA is not compatible with head-grouped paging "
+                "(page_group_size); these features are mutually exclusive."
+            )
+            return HeadGroupedAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                page_group_size=page_group_size,
+                sliding_window=self.sliding_window,
+            )
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"

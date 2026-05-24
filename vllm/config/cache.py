@@ -144,8 +144,49 @@ class CacheConfig:
 
     kv_offloading_backend: KVOffloadingBackend | None = None
     """The backend to use for KV cache offloading. Supported backends include
-    'native' (vLLM native CPU offloading), 'lmcache' This option must be used 
+    'native' (vLLM native CPU offloading), 'lmcache' This option must be used
     together with kv_offloading_size."""
+
+    # Head-group paging.
+    page_group_size: int | None = 4
+    """Head-group size; ``None`` disables head-group paging.
+    Must divide ``num_kv_heads``."""
+
+    # Non-uniform KV cache compression.
+    enable_compression: bool = False
+    """Enable non-uniform KV cache compression."""
+    compression_ratio: float = 0.3
+    """Fraction of tokens kept per chunk; each chunk keeps
+    ``floor(ratio * re_eval_size)`` tokens."""
+    compression_window_size: int = 32
+    """Recent tokens always kept during scoring."""
+    compression_n_sink_tokens: int = 4
+    """Prefix sink tokens always kept during scoring."""
+    compression_floor_min: int = 512
+    """Per-(layer, group) ``kept_lengths`` floor in tokens; 0 disables it."""
+    compression_chunk_size: int = 2048
+    """Chunk size for compression-aware chunked prefill (independent from
+    ``long_prefill_token_threshold``)."""
+    compression_gate_path: str = "fastkvzip"
+    """Gate checkpoint. The default ``"fastkvzip"`` sentinel triggers a
+    HuggingFace Hub download of ``Jang-Hyun/Fast-KVzip``; a local path is
+    also accepted."""
+
+    # Multi-turn serving.
+    multi_turn: bool = False
+    """Enable multi-turn auto-advance. With this on, a request can carry
+    ``multi_turn_token_ids`` and the scheduler advances turns automatically."""
+
+    # Engine-derived; do not set manually.
+    num_kv_heads: int | None = field(default=None, init=False)
+    """Total KV head count; populated by ``derive_from_model``."""
+    num_hidden_layers: int | None = field(default=None, init=False)
+    """Total transformer layer count; populated by ``derive_from_model``."""
+    num_head_groups_per_layer: int | None = field(default=None, init=False)
+    """``num_kv_heads // page_group_size``."""
+    num_head_groups: int | None = field(default=None, init=False)
+    """``num_head_groups_per_layer * num_hidden_layers`` — the block
+    table's group dimension."""
 
     def compute_hash(self) -> str:
         """
@@ -176,6 +217,15 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # Model-meta / runtime policy fields that don't change kernel
+            # selection or compiled graph shape.
+            "num_kv_heads",
+            "num_hidden_layers",
+            "num_head_groups",
+            "num_head_groups_per_layer",
+            "compression_ratio",
+            "compression_floor_min",
+            "compression_chunk_size",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -199,6 +249,124 @@ class CacheConfig:
                 "scaling factor."
             )
         return cache_dtype
+
+    def __post_init__(self) -> None:
+        # CacheConfig can be constructed standalone, so head-count-dependent
+        # checks run only once ``num_kv_heads`` / ``num_hidden_layers`` are
+        # populated.
+        self._validate_extended_fields()
+        if self.num_kv_heads is not None and self.num_hidden_layers is not None:
+            self._derive_head_groups()
+
+    def derive_from_model(self, model_config: Any) -> None:
+        """Populate KV head / layer counts from ``model_config`` and re-run
+        validation."""
+        self.num_kv_heads = model_config.get_total_num_kv_heads()
+        self.num_hidden_layers = model_config.get_total_num_hidden_layers()
+        self._derive_head_groups()
+        self._validate_extended_fields()
+
+    def _derive_head_groups(self) -> None:
+        if self.page_group_size is None:
+            return
+        assert self.num_kv_heads is not None
+        assert self.num_hidden_layers is not None
+        self.num_head_groups_per_layer = self.num_kv_heads // self.page_group_size
+        self.num_head_groups = (
+            self.num_head_groups_per_layer * self.num_hidden_layers
+        )
+
+    def _validate_extended_fields(self) -> None:
+        # Head-group paging.
+        if self.page_group_size is not None:
+            if self.page_group_size <= 0:
+                raise ValueError(
+                    f"page_group_size must be > 0, got {self.page_group_size}."
+                )
+            if self.num_kv_heads is not None:
+                if self.num_kv_heads % self.page_group_size != 0:
+                    raise ValueError(
+                        f"num_kv_heads ({self.num_kv_heads}) must be divisible "
+                        f"by page_group_size ({self.page_group_size}). Pick a "
+                        f"page_group_size that divides num_kv_heads."
+                    )
+                if self.num_kv_heads // self.page_group_size < 1:
+                    raise ValueError(
+                        f"num_head_groups_per_layer must be >= 1; got "
+                        f"num_kv_heads={self.num_kv_heads}, "
+                        f"page_group_size={self.page_group_size}."
+                    )
+
+        # Compression.
+        if self.enable_compression:
+            if self.page_group_size is None:
+                raise ValueError(
+                    "enable_compression=True requires page_group_size to be "
+                    "set; compression operates on top of head-group paging."
+                )
+            if not (0.0 < self.compression_ratio <= 1.0):
+                raise ValueError(
+                    f"compression_ratio must satisfy 0 < r <= 1, got "
+                    f"{self.compression_ratio}."
+                )
+            if self.compression_window_size <= 0:
+                raise ValueError(
+                    f"compression_window_size must be > 0, got "
+                    f"{self.compression_window_size}."
+                )
+            if self.compression_n_sink_tokens < 0:
+                raise ValueError(
+                    f"compression_n_sink_tokens must be >= 0, got "
+                    f"{self.compression_n_sink_tokens}."
+                )
+            if self.compression_floor_min < 0:
+                raise ValueError(
+                    f"compression_floor_min must be >= 0, got "
+                    f"{self.compression_floor_min}."
+                )
+            if self.compression_chunk_size <= 0:
+                raise ValueError(
+                    f"compression_chunk_size must be > 0, got "
+                    f"{self.compression_chunk_size}."
+                )
+            if self.compression_chunk_size <= self.compression_window_size:
+                raise ValueError(
+                    f"compression_chunk_size ({self.compression_chunk_size}) "
+                    f"must be greater than compression_window_size "
+                    f"({self.compression_window_size})."
+                )
+            if not isinstance(self.compression_gate_path, str) or not (
+                self.compression_gate_path
+            ):
+                raise ValueError(
+                    "compression_gate_path must be a non-empty string "
+                    "(either 'fastkvzip' for HF download or a local path)."
+                )
+
+        # Multi-turn rides on top of head-group paging but does not
+        # require compression.
+        if self.multi_turn:
+            if self.page_group_size is None:
+                raise ValueError(
+                    "multi_turn=True requires page_group_size to be set."
+                )
+            if self.enable_prefix_caching:
+                raise ValueError(
+                    "multi_turn=True is incompatible with "
+                    "enable_prefix_caching=True (multi-turn carry-over "
+                    "replaces prefix caching)."
+                )
+
+        # Prefix caching is incompatible with compression and head-group
+        # paging; auto-disable.
+        if (self.enable_compression or self.page_group_size is not None) and (
+            self.enable_prefix_caching
+        ):
+            logger.info(
+                "Disabling enable_prefix_caching (incompatible with %s).",
+                "compression" if self.enable_compression else "head-group paging",
+            )
+            self.enable_prefix_caching = False
 
     def verify_with_parallel_config(
         self,

@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+import numpy as np
+
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
@@ -12,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
+    HeadGroupedAttentionSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -49,10 +52,32 @@ class SingleTypeKVCacheManager(ABC):
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
 
-        # Mapping from request ID to blocks to track the blocks allocated
-        # for each request, so that we can free the blocks when the request
-        # is finished.
-        self.req_to_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
+        # Head-grouped paging: a token-position requires
+        # ``num_head_groups_total = num_head_groups_per_layer × num_layers``
+        # globally-unique block ids, popped in one
+        # ``BlockPool.get_new_blocks`` call.
+        self.head_grouped = isinstance(kv_cache_spec, HeadGroupedAttentionSpec)
+        if self.head_grouped:
+            self.num_head_groups_total = block_pool.num_head_groups
+            assert self.num_head_groups_total is not None, (
+                "BlockPool.num_head_groups must be set for "
+                "HeadGroupedAttentionSpec.")
+        else:
+            self.num_head_groups_total = 1
+
+        # Per-request allocated blocks. Source of truth for the non-
+        # head-grouped path; left empty in head-grouped mode (see
+        # ``req_to_block_ids``).
+        self.req_to_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(
+            list)
+
+        # Head-grouped only: per-request int32 ndarray of physical block
+        # ids, ordered group-major within a layer (matches
+        # ``BlockTable.append_row``). Source of truth here because
+        # compression-driven frees update it via a numpy bitmap filter
+        # in ``free_blocks_by_ids``. Block objects are materialised on
+        # demand for the rare paths that need them.
+        self.req_to_block_ids: dict[str, np.ndarray] = {}
 
         # {req_id: The number of cached blocks for this given request}
         # This is used to track the number of cached blocks for each request.
@@ -67,7 +92,7 @@ class SingleTypeKVCacheManager(ABC):
         self,
         request_id: str,
         num_tokens: int,
-        new_computed_blocks: Sequence[KVCacheBlock],
+        new_computed_blocks: Sequence[KVCacheBlock] | np.ndarray,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -77,29 +102,42 @@ class SingleTypeKVCacheManager(ABC):
             num_tokens: The total number of tokens that need a slot (including
                 tokens that are already allocated).
             new_computed_blocks: The new computed blocks just hitting the
-                prefix caching.
+                prefix caching. Accepts ``Sequence[KVCacheBlock]`` (base
+                path) or ``np.ndarray`` of block ids (head-grouped path
+                — always empty since prefix caching is disabled there).
 
         Returns:
             The number of blocks.
         """
 
         num_required_blocks = cdiv(num_tokens, self.block_size)
+        num_groups = self.num_head_groups_total
+        is_ndarray = isinstance(new_computed_blocks, np.ndarray)
+        num_computed = (int(new_computed_blocks.size) if is_ndarray
+                        else len(new_computed_blocks))
+        if self.head_grouped:
+            ids = self.req_to_block_ids.get(request_id)
+            existing_len = 0 if ids is None else int(ids.size)
+        else:
+            existing_len = len(self.req_to_blocks[request_id])
         num_new_blocks = (
-            num_required_blocks
-            - len(new_computed_blocks)
-            - len(self.req_to_blocks[request_id])
-        )
-        # If a computed block of a request is an eviction candidate (in the
-        # free queue and ref_cnt == 0), it will be changed from a free block
-        # to a computed block when the request is allocated, so we also count
-        # it as needed to be allocated.
-        num_evictable_computed_blocks = sum(
-            blk.ref_cnt == 0 and not blk.is_null for blk in new_computed_blocks
-        )
+            num_required_blocks * num_groups - num_computed - existing_len)
+        # If a computed block is an eviction candidate (ref_cnt == 0), it
+        # will be revived during allocation so it counts as new. The
+        # ndarray branch carries no per-block ref_cnt (head-grouped caching
+        # is disabled) and the count is always 0.
+        if is_ndarray:
+            num_evictable_computed_blocks = 0
+        else:
+            num_evictable_computed_blocks = sum(
+                blk.ref_cnt == 0 and not blk.is_null for blk in new_computed_blocks
+            )
         return num_new_blocks + num_evictable_computed_blocks
 
     def save_new_computed_blocks(
-        self, request_id: str, new_computed_blocks: Sequence[KVCacheBlock]
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock] | np.ndarray,
     ) -> None:
         """
         Add the new computed blocks to the request.
@@ -107,21 +145,41 @@ class SingleTypeKVCacheManager(ABC):
         Args:
             request_id: The request ID.
             new_computed_blocks: The new computed blocks just hitting the
-                prefix cache.
+                prefix cache. ``Sequence[KVCacheBlock]`` (base path) or
+                ``np.ndarray`` of block ids (head-grouped path).
         """
+        is_ndarray = isinstance(new_computed_blocks, np.ndarray)
+        num_computed = (int(new_computed_blocks.size) if is_ndarray
+                        else len(new_computed_blocks))
         if request_id not in self.num_cached_block:
-            # A new request.
-            req_blocks = self.req_to_blocks[request_id]
-            assert len(req_blocks) == 0
-            req_blocks.extend(new_computed_blocks)
-            self.num_cached_block[request_id] = len(new_computed_blocks)
+            if self.head_grouped:
+                assert (
+                    request_id not in self.req_to_block_ids
+                    or self.req_to_block_ids[request_id].size == 0
+                )
+                if num_computed:
+                    if is_ndarray:
+                        self.req_to_block_ids[request_id] = (
+                            new_computed_blocks.astype(np.int32, copy=False)
+                        )
+                    else:
+                        self.req_to_block_ids[request_id] = np.fromiter(
+                            (b.block_id for b in new_computed_blocks),
+                            dtype=np.int32,
+                            count=num_computed,
+                        )
+            else:
+                req_blocks = self.req_to_blocks[request_id]
+                assert len(req_blocks) == 0
+                req_blocks.extend(new_computed_blocks)
+            self.num_cached_block[request_id] = num_computed
         else:
-            # A running request. Should not have new computed blocks.
-            assert len(new_computed_blocks) == 0
+            # A running request must not have new computed blocks.
+            assert num_computed == 0
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int
-    ) -> list[KVCacheBlock]:
+    ) -> list[KVCacheBlock] | np.ndarray:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
         token slots.
@@ -132,11 +190,30 @@ class SingleTypeKVCacheManager(ABC):
                 tokens that are already allocated).
 
         Returns:
-            The new allocated blocks.
+            ``list[KVCacheBlock]`` for the base path,
+            ``np.ndarray[int32]`` of block ids for the head-grouped path.
         """
-        req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
-        num_new_blocks = num_required_blocks - len(req_blocks)
+        num_groups = self.num_head_groups_total
+        if self.head_grouped:
+            existing = self.req_to_block_ids.get(request_id)
+            existing_len = 0 if existing is None else int(existing.size)
+            num_new_blocks = num_required_blocks * num_groups - existing_len
+            if num_new_blocks <= 0:
+                return np.empty(0, dtype=np.int32)
+            # Pull new ids directly from the ring buffer; the int32 array
+            # bypasses per-block ref_cnt updates and KVCacheBlock
+            # materialisation.
+            new_ids = self.block_pool.get_new_block_ids(num_new_blocks)
+            if existing is None or existing.size == 0:
+                self.req_to_block_ids[request_id] = new_ids
+            else:
+                self.req_to_block_ids[request_id] = np.concatenate(
+                    [existing, new_ids]
+                )
+            return new_ids
+        req_blocks = self.req_to_blocks[request_id]
+        num_new_blocks = num_required_blocks * num_groups - len(req_blocks)
         if num_new_blocks <= 0:
             return []
         else:
@@ -161,7 +238,7 @@ class SingleTypeKVCacheManager(ABC):
 
         self.block_pool.cache_full_blocks(
             request=request,
-            blocks=self.req_to_blocks[request.request_id],
+            blocks=self.get_req_blocks(request.request_id),
             num_cached_blocks=num_cached_blocks,
             num_full_blocks=num_full_blocks,
             block_size=self.block_size,
@@ -170,6 +247,36 @@ class SingleTypeKVCacheManager(ABC):
 
         self.num_cached_block[request.request_id] = num_full_blocks
 
+    def get_req_blocks(self, request_id: str) -> list[KVCacheBlock]:
+        """Return the request's current ``KVCacheBlock`` list.
+
+        Base path returns the eagerly-maintained list (mutations persist).
+        Head-grouped mode materialises a fresh list from
+        ``req_to_block_ids`` via ``block_pool.blocks[bid]``; mutations to
+        the returned list are not visible to subsequent calls. Prefer
+        ``get_req_block_ids_array`` when only ids are needed.
+        """
+        if self.head_grouped:
+            ids = self.req_to_block_ids.get(request_id)
+            if ids is None or ids.size == 0:
+                return []
+            pool_blocks = self.block_pool.blocks
+            return [pool_blocks[int(bid)] for bid in ids.tolist()]
+        return self.req_to_blocks.get(request_id, [])
+
+    def get_req_block_ids_array(self, request_id: str) -> np.ndarray:
+        """Return the request's int32 block-id ndarray. Head-grouped only.
+
+        Returns an empty ndarray (not None) when the request has no blocks.
+        """
+        assert self.head_grouped, (
+            "get_req_block_ids_array is head-grouped only."
+        )
+        ids = self.req_to_block_ids.get(request_id)
+        if ids is None:
+            return np.empty(0, dtype=np.int32)
+        return ids
+
     def free(self, request_id: str) -> None:
         """
         Free the blocks for the request.
@@ -177,6 +284,18 @@ class SingleTypeKVCacheManager(ABC):
         Args:
             request_id: The request ID.
         """
+        if self.head_grouped:
+            # int32 array is the source of truth; push it back to the ring
+            # buffer directly. Caching is disabled here, so eviction
+            # ordering does not matter.
+            ids = self.req_to_block_ids.pop(request_id, None)
+            self.req_to_blocks.pop(request_id, None)
+            if ids is None or ids.size == 0:
+                self.num_cached_block.pop(request_id, None)
+                return
+            self.block_pool.free_block_ids_array(ids)
+            self.num_cached_block.pop(request_id, None)
+            return
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
 
@@ -186,6 +305,74 @@ class SingleTypeKVCacheManager(ABC):
 
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
+
+    def free_blocks_by_ids(
+        self,
+        block_ids: "set[int] | np.ndarray",
+        candidate_req_ids: set[str] | None = None,
+    ) -> None:
+        """Drop named block ids from the per-request lookup after
+        compression so allocations don't double-count them.
+
+        Head-grouped mode filters the int32 ``req_to_block_ids`` array
+        with a numpy bitmap; ``req_to_blocks`` is rebuilt on demand by
+        ``get_req_blocks`` and is not touched here. The base path uses a
+        set-membership list comprehension.
+
+        ``block_ids`` accepts an int32/int64 ndarray (head-grouped) or a
+        ``set[int]`` (base). ``candidate_req_ids`` narrows the sweep; None
+        scans every running request.
+        """
+        is_ndarray = isinstance(block_ids, np.ndarray)
+        if is_ndarray:
+            if block_ids.size == 0:
+                return
+        elif not block_ids:
+            return
+        if self.head_grouped:
+            num_pool_blocks = len(self.block_pool.blocks)
+            if is_ndarray:
+                freed_arr = block_ids.astype(np.int64, copy=False)
+            else:
+                freed_arr = np.fromiter(block_ids, dtype=np.int64,
+                                        count=len(block_ids))
+            # Drop out-of-range ids to preserve the ``not in set`` silent
+            # no-op semantics of the base path.
+            in_range = freed_arr < num_pool_blocks
+            if not in_range.all():
+                freed_arr = freed_arr[in_range]
+                if freed_arr.size == 0:
+                    return
+            bitmap = np.zeros(num_pool_blocks, dtype=bool)
+            bitmap[freed_arr] = True
+            if candidate_req_ids is None:
+                iter_ids = list(self.req_to_block_ids.keys())
+            else:
+                iter_ids = candidate_req_ids
+            for req_id in iter_ids:
+                ids = self.req_to_block_ids.get(req_id)
+                if ids is None or ids.size == 0:
+                    continue
+                is_freed = bitmap[ids]
+                if not is_freed.any():
+                    continue
+                self.req_to_block_ids[req_id] = ids[~is_freed]
+            return
+        # Base path. ``in`` membership is O(N) on ndarray, so convert any
+        # stray ndarray to a set once.
+        if is_ndarray:
+            block_ids = set(block_ids.tolist())
+        if candidate_req_ids is None:
+            iter_ids = self.req_to_blocks.keys()
+        else:
+            iter_ids = candidate_req_ids
+        for req_id in iter_ids:
+            blocks = self.req_to_blocks.get(req_id)
+            if not blocks:
+                continue
+            kept = [blk for blk in blocks if blk.block_id not in block_ids]
+            if len(kept) != len(blocks):
+                self.req_to_blocks[req_id] = kept
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -338,10 +525,16 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         return computed_blocks
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
-        blocks = self.req_to_blocks[running_request_id]
+        if self.head_grouped:
+            # Head-grouped disables prefix caching, so every block has
+            # ref_cnt == 1 and the cascade-attention condition
+            # (ref_cnt == num_running) is false from the first block.
+            return 0
+        blocks = self.get_req_blocks(running_request_id)
+        num_running = len(self.req_to_blocks)
         num_common_blocks = 0
         for block in blocks:
-            if block.ref_cnt == len(self.req_to_blocks):
+            if block.ref_cnt == num_running:
                 num_common_blocks += 1
             else:
                 break
@@ -736,6 +929,10 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
     CrossAttentionSpec: CrossAttentionManager,
+    # Head-group paging reuses FullAttentionManager — prefix-caching
+    # paths are unreachable (disabled at the config layer) and the
+    # remaining alloc/free paths are spec-agnostic.
+    HeadGroupedAttentionSpec: FullAttentionManager,
 }
 
 

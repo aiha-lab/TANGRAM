@@ -32,6 +32,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
+    CompressionRequestMetadata,
     GrammarOutput,
     NewRequestData,
     SchedulerOutput,
@@ -209,6 +210,10 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        # Compression directives consumed by the worker via
+        # ``SchedulerOutput.compression_metadata``; populated only for
+        # requests whose prefill chunk is scheduled this step.
+        compression_metadata: dict[str, CompressionRequestMetadata] = {}
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -231,6 +236,18 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            # Compression-mode prefill is capped by
+            # ``compression_chunk_size`` so per-chunk eviction stays
+            # predictable. Decode chunks (num_computed >= num_prompt) skip
+            # this branch entirely.
+            if (
+                self.cache_config.enable_compression
+                and self.cache_config.compression_chunk_size is not None
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                chunk_cap = int(self.cache_config.compression_chunk_size)
+                if 0 < chunk_cap < num_new_tokens:
+                    num_new_tokens = chunk_cap
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len or
@@ -276,6 +293,11 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            # Once a request has been compressed, size the next allocation
+            # against post-compression cache occupancy rather than
+            # ``num_computed_tokens``.
+            effective_num_cached_tokens = request.compress_max_eff_seq_len
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -283,6 +305,7 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        effective_num_cached_tokens=effective_num_cached_tokens,
                     )
 
                     if new_blocks is not None:
@@ -327,6 +350,15 @@ class Scheduler(SchedulerInterface):
                     preempted_req.status = RequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
                     preempted_req.num_preemptions += 1
+                    # Preempt under once-only compression: the cache is
+                    # gone, so the resumed prefill must run as the first
+                    # cycle again. Reset compression bookkeeping and absorb
+                    # already-sampled output tokens into the prompt so the
+                    # resumed cycle reattends them.
+                    if self.cache_config.enable_compression:
+                        preempted_req.compression_done = False
+                        preempted_req.compress_max_eff_seq_len = None
+                        preempted_req.absorb_output_into_prompt()
                     if self.log_stats:
                         preempted_req.record_event(
                             EngineCoreEventType.PREEMPTED, scheduled_timestamp
@@ -347,6 +379,9 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            self._maybe_add_compression_metadata(
+                request, num_new_tokens, compression_metadata
+            )
             req_index += 1
 
             # Speculative decode related.
@@ -502,6 +537,17 @@ class Scheduler(SchedulerInterface):
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
+                    # Same chunk cap as the RUNNING path; applied here so a
+                    # single-step admission doesn't bypass it.
+                    if (
+                        self.cache_config.enable_compression
+                        and self.cache_config.compression_chunk_size is not None
+                        and num_computed_tokens < request.num_prompt_tokens
+                    ):
+                        chunk_cap = int(self.cache_config.compression_chunk_size)
+                        if 0 < chunk_cap < num_new_tokens:
+                            num_new_tokens = chunk_cap
+
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
                     if (
@@ -553,6 +599,11 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
+                # New requests have ``compress_max_eff_seq_len is None`` so
+                # the base path runs; only resumed requests carry a value
+                # from a prior compression cycle.
+                effective_num_cached_tokens = request.compress_max_eff_seq_len
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
@@ -561,6 +612,7 @@ class Scheduler(SchedulerInterface):
                     num_lookahead_tokens=effective_lookahead_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    effective_num_cached_tokens=effective_num_cached_tokens,
                 )
 
                 if new_blocks is None:
@@ -610,6 +662,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                self._maybe_add_compression_metadata(
+                    request, num_new_tokens, compression_metadata
+                )
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -707,6 +762,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            compression_metadata=compression_metadata,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -728,7 +784,48 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
         return scheduler_output
+
+    def _maybe_add_compression_metadata(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        compression_metadata: dict[str, "CompressionRequestMetadata"],
+    ) -> None:
+        """Add a ``CompressionRequestMetadata`` entry when compression is
+        enabled and this step advances prefill.
+
+        Once-only policy: compression fires only over the first prefill
+        cycle; ``compression_done`` (set sticky in ``update_from_output``)
+        gates every subsequent step.
+        """
+        if not self.cache_config.enable_compression:
+            return
+        if request.compression_done:
+            return
+        # Decode chunk (prefill already finished): no compression.
+        if request.num_computed_tokens >= request.num_prompt_tokens:
+            return
+        chunk_in_seq_idx = (
+            request.num_computed_tokens // self.cache_config.compression_chunk_size
+            if self.cache_config.compression_chunk_size
+            else 0
+        )
+        is_last_chunk = (
+            request.num_computed_tokens + num_new_tokens
+            >= request.num_prompt_tokens
+        )
+        compression_metadata[request.request_id] = CompressionRequestMetadata(
+            req_id=request.request_id,
+            compression_ratio=float(self.cache_config.compression_ratio),
+            window_size=int(self.cache_config.compression_window_size or 0),
+            n_sink_tokens=int(self.cache_config.compression_n_sink_tokens or 0),
+            floor_min=int(self.cache_config.compression_floor_min or 0),
+            chunk_in_sequence_idx=int(chunk_in_seq_idx),
+            is_last_chunk=bool(is_last_chunk),
+            total_prompt_tokens=int(request.num_prompt_tokens),
+        )
 
     def _update_after_schedule(
         self,
@@ -776,6 +873,9 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        # Multi-turn: requests whose ``advance_to_next_turn`` flag is set;
+        # the worker resyncs its CachedRequestState for these.
+        advanced_turn_req_ids: set[str] = set()
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -798,7 +898,15 @@ class Scheduler(SchedulerInterface):
             if idx >= num_running_reqs:
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+            # Multi-turn: if the request just advanced, the worker's
+            # CachedRequestState predates the new user tokens, so we must
+            # force-resend ``all_token_ids`` regardless of
+            # ``scheduled_in_prev_step``.
+            if req.just_advanced_to_next_turn:
+                all_token_ids[req_id] = req.all_token_ids.copy()
+                advanced_turn_req_ids.add(req_id)
+                req.just_advanced_to_next_turn = False
+            elif not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
@@ -811,6 +919,7 @@ class Scheduler(SchedulerInterface):
         return CachedRequestData(
             req_ids=req_ids,
             resumed_req_ids=resumed_req_ids,
+            advanced_turn_req_ids=advanced_turn_req_ids,
             new_token_ids=new_token_ids,
             all_token_ids=all_token_ids,
             new_block_ids=new_block_ids,
@@ -1011,6 +1120,57 @@ class Scheduler(SchedulerInterface):
                 kv_connector_output.invalid_block_ids
             )
 
+        # Fold compression results back into scheduler bookkeeping: mirror
+        # each compressed request's kept length onto its Request (so the
+        # next ``allocate_slots`` sizes against post-compression occupancy)
+        # and return freed block ids to the pool.
+        compressed_this_step: set[str] = set()
+        if model_runner_output.compression_new_eff_seq_lens:
+            for req_id, eff_list in (
+                model_runner_output.compression_new_eff_seq_lens.items()
+            ):
+                request = self.requests.get(req_id)
+                if request is None:
+                    continue
+                if not eff_list:
+                    continue
+                # Every (layer, head-group) holds the same kept length;
+                # max() is a defensive upper bound for block sizing.
+                request.compress_max_eff_seq_len = int(max(eff_list))
+                compressed_this_step.add(req_id)
+                # Sticky once-only flag: set on the last prefill chunk so
+                # subsequent steps skip compression entirely.
+                cm = scheduler_output.compression_metadata.get(req_id)
+                if cm is not None and cm.is_last_chunk:
+                    request.compression_done = True
+        freed_ids = model_runner_output.compression_freed_block_ids
+        if freed_ids is not None and freed_ids.size > 0:
+            # ``compression_new_eff_seq_lens`` keys cover every owner of
+            # ``compression_freed_block_ids``, so they bound the per-request
+            # sweep.
+            candidate_req_ids: set[str] | None = (
+                set(model_runner_output.compression_new_eff_seq_lens.keys())
+                if model_runner_output.compression_new_eff_seq_lens
+                else None
+            )
+            self.kv_cache_manager.free_blocks_by_ids(
+                freed_ids,
+                candidate_req_ids=candidate_req_ids,
+            )
+
+        # Keep ``compress_max_eff_seq_len`` in sync with cache occupancy on
+        # non-compression steps too — mirrors the worker-side
+        # ``effective_seq_lens_cpu`` increment. Without this, decode writes
+        # would spill back into block 0 once they exceeded the post-
+        # compression block count.
+        for req_id, num_tokens in num_scheduled_tokens.items():
+            if num_tokens <= 0 or req_id in compressed_this_step:
+                continue
+            request = self.requests.get(req_id)
+            if (request is not None
+                    and request.compress_max_eff_seq_len is not None):
+                request.compress_max_eff_seq_len += num_tokens
+
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -1076,6 +1236,13 @@ class Scheduler(SchedulerInterface):
                 stopped = check_stop(request, self.max_model_len, pooler_output)
 
             if stopped:
+                if request.multi_turn_token_ids is not None:
+                    # Multi-turn: capture the final turn's output before the
+                    # request is freed; earlier turns were snapshotted in
+                    # ``Request.advance_to_next_turn``.
+                    request.turn_output_token_ids.append(
+                        list(request.output_token_ids)
+                    )
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1104,6 +1271,17 @@ class Scheduler(SchedulerInterface):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params:
+                # Multi-turn: ship per-turn outputs only on the final
+                # EngineCoreOutput; intermediate turns are visible via the
+                # assembled list when the request finishes.
+                turn_outputs_for_this_event = (
+                    request.turn_output_token_ids
+                    if (
+                        request.is_finished()
+                        and request.multi_turn_token_ids is not None
+                    )
+                    else None
+                )
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1119,6 +1297,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        turn_output_token_ids=turn_outputs_for_this_event,
                     )
                 )
             else:

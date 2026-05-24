@@ -159,6 +159,104 @@ class FullAttentionSpec(AttentionSpec):
 
 
 @dataclass(frozen=True)
+class HeadGroupedAttentionSpec(AttentionSpec):
+    """Head-group paging spec.
+
+    A block holds ``page_group_size`` (not ``num_kv_heads``) KV heads of
+    ``block_size`` tokens to enable per-head-group eviction. Per-layer
+    per-request memory matches ``FullAttentionSpec`` — only the block
+    partitioning differs. Mutually exclusive with MLA.
+    """
+
+    page_group_size: int = 0
+    sliding_window: int | None = None
+    attention_chunk_size: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.page_group_size <= 0:
+            raise ValueError(
+                f"HeadGroupedAttentionSpec.page_group_size must be a positive "
+                f"int, got {self.page_group_size}."
+            )
+        if self.num_kv_heads % self.page_group_size != 0:
+            raise ValueError(
+                f"num_kv_heads ({self.num_kv_heads}) must be divisible by "
+                f"page_group_size ({self.page_group_size})."
+            )
+
+    @property
+    def num_head_groups_per_layer(self) -> int:
+        return self.num_kv_heads // self.page_group_size
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            2
+            * self.block_size
+            * self.page_group_size
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        # Per-layer max bytes for one request. Token-positions are split
+        # across ``num_head_groups_per_layer`` blocks; the total per-layer
+        # value equals ``FullAttentionSpec`` (smaller blocks, more of
+        # them). The caller sums across layers, so the single global
+        # pool's per-token cost is covered naturally.
+        max_model_len = vllm_config.model_config.max_model_len
+        return (
+            cdiv(max_model_len, self.block_size)
+            * self.num_head_groups_per_layer
+            * self.page_size_bytes
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, HeadGroupedAttentionSpec) for spec in specs), (
+            "All attention layers in the same head-grouped KV cache group must "
+            "be HeadGroupedAttentionSpec."
+        )
+        sliding_window = set(
+            spec.sliding_window for spec in specs if spec.sliding_window is not None
+        )
+        attention_chunk_size = set(
+            spec.attention_chunk_size
+            for spec in specs
+            if spec.attention_chunk_size is not None
+        )
+        merged = cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=specs[0].dtype,
+            page_group_size=specs[0].page_group_size,
+            sliding_window=FullAttentionSpec.merge_window_sizes(sliding_window),
+            attention_chunk_size=FullAttentionSpec.merge_window_sizes(
+                attention_chunk_size
+            ),
+        )
+        # All identifying fields must match across the group.
+        for spec in specs:
+            for f in fields(AttentionSpec):
+                assert getattr(spec, f.name) == getattr(merged, f.name), (
+                    "All attention layers in the same head-grouped KV cache "
+                    "group must have the same attention spec."
+                )
+            assert spec.page_group_size == merged.page_group_size, (
+                "All attention layers in the same head-grouped KV cache group "
+                "must have the same page_group_size."
+            )
+        assert (merged.sliding_window is not None) + (
+            merged.attention_chunk_size is not None
+        ) <= 1, (
+            "Model with both sliding window layers and chunked local attention "
+            "layers is not supported under head-grouped paging."
+        )
+        return merged
+
+
+@dataclass(frozen=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
@@ -316,7 +414,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             # Different block sizes, not uniform.
             return False
         one_spec = next(iter(kv_cache_specs.values()))
-        if isinstance(one_spec, FullAttentionSpec):
+        if isinstance(one_spec, HeadGroupedAttentionSpec):
+            return all(
+                isinstance(spec, HeadGroupedAttentionSpec)
+                and spec.page_group_size == one_spec.page_group_size
+                for spec in kv_cache_specs.values()
+            )
+        elif isinstance(one_spec, FullAttentionSpec):
             return all(
                 isinstance(spec, FullAttentionSpec) for spec in kv_cache_specs.values()
             )

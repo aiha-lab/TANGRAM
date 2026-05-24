@@ -394,6 +394,8 @@ class Processor:
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        multi_turn_token_ids: list[list[int]] | None = None,
+        turn_max_tokens: list[int] | None = None,
     ) -> EngineCoreRequest:
         self._validate_lora(lora_request)
         self._validate_params(params)
@@ -508,6 +510,38 @@ class Processor:
                     )
                 )
 
+        # Multi-turn validation: the engine flag must be on, and
+        # ``multi_turn_token_ids[0]`` must equal ``prompt_token_ids``.
+        if multi_turn_token_ids is not None:
+            if not self.cache_config.multi_turn:
+                raise ValueError(
+                    "multi_turn_token_ids was provided but the engine was "
+                    "constructed with cache_config.multi_turn=False. Set "
+                    "multi_turn=True on the LLM/EngineArgs."
+                )
+            if not multi_turn_token_ids:
+                raise ValueError(
+                    "multi_turn_token_ids must contain at least one turn."
+                )
+            if prompt_token_ids is None:
+                raise ValueError(
+                    "Multi-turn requests require token-id prompts; "
+                    "prompt_embeds is not supported."
+                )
+            if list(multi_turn_token_ids[0]) != list(prompt_token_ids):
+                raise ValueError(
+                    "multi_turn_token_ids[0] must equal the request's "
+                    "tokenized prompt (turn 0). Pass identical tokens for "
+                    "the initial turn."
+                )
+            if turn_max_tokens is not None and len(turn_max_tokens) != len(
+                multi_turn_token_ids
+            ):
+                raise ValueError(
+                    "turn_max_tokens must have the same length as "
+                    "multi_turn_token_ids."
+                )
+
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
@@ -522,6 +556,8 @@ class Processor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            multi_turn_token_ids=multi_turn_token_ids,
+            turn_max_tokens=turn_max_tokens,
         )
 
     def _validate_model_inputs(

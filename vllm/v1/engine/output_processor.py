@@ -204,6 +204,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        turn_output_token_ids: list[list[int]] | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -253,7 +254,11 @@ class RequestState:
                 return None
 
         return self._new_request_output(
-            request_id, outputs, finished, kv_transfer_params
+            request_id,
+            outputs,
+            finished,
+            kv_transfer_params,
+            turn_output_token_ids=turn_output_token_ids,
         )
 
     def _new_request_output(
@@ -262,6 +267,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        turn_output_token_ids: list[list[int]] | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         first_output = outputs[0]
         if isinstance(first_output, PoolingOutput):
@@ -297,6 +303,7 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
+            turn_output_token_ids=turn_output_token_ids,
         )
 
     def _new_completion_output(
@@ -507,6 +514,7 @@ class OutputProcessor:
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                turn_output_token_ids=engine_core_output.turn_output_token_ids,
             ):
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().

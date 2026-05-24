@@ -44,6 +44,10 @@ def check_stop(
 ) -> bool:
     if request.pooling_params:
         if pooler_output is not None:
+            # Multi-turn pooling requests advance the same way as generative.
+            if request.advance_to_next_turn():
+                request.status = RequestStatus.RUNNING
+                return False
             request.status = RequestStatus.FINISHED_STOPPED
             return True
         return False
@@ -51,22 +55,43 @@ def check_stop(
     sampling_params = request.sampling_params
     assert sampling_params is not None
 
-    if request.num_output_tokens < sampling_params.min_tokens:
+    # ``min_tokens`` suppresses early EOS / stop-token termination but must
+    # not override the per-turn ``max_tokens`` cap; otherwise a multi-turn
+    # warm-up turn (max_tokens < min_tokens) can never reach
+    # ``advance_to_next_turn`` and the engine hangs at 0 scheduled tokens.
+    if (request.num_output_tokens < sampling_params.min_tokens
+            and request.num_output_tokens < request.max_tokens):
         return False
 
     last_token_id = request.output_token_ids[-1]
+    turn_stopped = False
     if not sampling_params.ignore_eos and last_token_id == request.eos_token_id:
-        request.status = RequestStatus.FINISHED_STOPPED
-        return True
-
-    if last_token_id in (sampling_params.stop_token_ids or ()):
-        request.status = RequestStatus.FINISHED_STOPPED
+        turn_stopped = True
+    elif last_token_id in (sampling_params.stop_token_ids or ()):
+        turn_stopped = True
         request.stop_reason = last_token_id
-        return True
-    if (
-        request.num_tokens >= max_model_len
-        or request.num_output_tokens >= request.max_tokens
-    ):
+    elif request.num_tokens >= max_model_len:
+        # Model-length cap cannot be carried into another turn.
         request.status = RequestStatus.FINISHED_LENGTH_CAPPED
         return True
-    return False
+    elif request.num_output_tokens >= request.max_tokens:
+        # Per-turn cap reached — for multi-turn this is the advance trigger.
+        turn_stopped = True
+
+    if not turn_stopped:
+        return False
+
+    # ``advance_to_next_turn`` returns False for single-turn requests and
+    # for the last turn of a multi-turn request — exactly when we want to
+    # actually finish.
+    if request.advance_to_next_turn():
+        request.status = RequestStatus.RUNNING
+        request.stop_reason = None
+        return False
+    if not sampling_params.ignore_eos and last_token_id == request.eos_token_id:
+        request.status = RequestStatus.FINISHED_STOPPED
+    elif last_token_id in (sampling_params.stop_token_ids or ()):
+        request.status = RequestStatus.FINISHED_STOPPED
+    else:
+        request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    return True

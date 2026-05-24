@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -111,6 +111,11 @@ class CachedRequestData:
     # the request's block IDs. For those in the set, new_block_ids will be used as the
     # request's block IDs instead of appending to the existing block IDs.
     resumed_req_ids: set[str]
+    # Multi-turn: ids of requests whose ``advance_to_next_turn`` fired this
+    # step. The full updated ``all_token_ids`` is sent in ``all_token_ids``
+    # and the worker refreshes its CachedRequestState (drop
+    # output_token_ids, extend prompt_token_ids, update num_tokens).
+    advanced_turn_req_ids: set[str]
     # NOTE(woosuk): new_token_ids is only used for pipeline parallelism.
     # When PP is not used, new_token_ids will be empty.
     new_token_ids: list[list[int]]
@@ -143,12 +148,37 @@ class CachedRequestData:
         return cls(
             req_ids=[],
             resumed_req_ids=set(),
+            advanced_turn_req_ids=set(),
             new_token_ids=[],
             all_token_ids={},
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
         )
+
+
+@dataclass
+class CompressionRequestMetadata:
+    """Per-request compression directives attached to ``SchedulerOutput``.
+
+    Populated only for prefill chunks of compression-enabled requests;
+    empty otherwise. Consumed by
+    ``GpuModelRunner._execute_with_compression``.
+    """
+    req_id: str
+    # Keep fraction of the re-eval region per chunk
+    # (``CacheConfig.compression_ratio``). Per-chunk K_new is
+    # ``floor(ratio * re_eval_size)``. 0 < ratio <= 1.
+    compression_ratio: float
+    window_size: int
+    n_sink_tokens: int
+    # Absolute per-(layer, group) ``kept_lengths`` floor; 0 disables it.
+    floor_min: int
+    chunk_in_sequence_idx: int
+    is_last_chunk: bool
+    # Total prompt length of this request's first prefill cycle, for
+    # logging only.
+    total_prompt_tokens: int = 0
 
 
 @bc_linter_include
@@ -202,6 +232,11 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+
+    # Per-request compression directives; empty on non-compression steps.
+    compression_metadata: dict[str, CompressionRequestMetadata] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

@@ -221,6 +221,16 @@ class LLM:
         kv_cache_memory_bytes: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
+        # Head-group paging, compression, multi-turn.
+        page_group_size: int | None = None,
+        enable_compression: bool = False,
+        compression_ratio: float = 0.3,
+        compression_window_size: int = 32,
+        compression_n_sink_tokens: int = 4,
+        compression_floor_min: int = 512,
+        compression_chunk_size: int = 2048,
+        compression_gate_path: str = "fastkvzip",
+        multi_turn: bool = False,
         **kwargs: Any,
     ) -> None:
         """LLM constructor."""
@@ -334,6 +344,15 @@ class LLM:
             structured_outputs_config=structured_outputs_instance,
             compilation_config=compilation_config_instance,
             logits_processors=logits_processors,
+            page_group_size=page_group_size,
+            enable_compression=enable_compression,
+            compression_ratio=compression_ratio,
+            compression_window_size=compression_window_size,
+            compression_n_sink_tokens=compression_n_sink_tokens,
+            compression_floor_min=compression_floor_min,
+            compression_chunk_size=compression_chunk_size,
+            compression_gate_path=compression_gate_path,
+            multi_turn=multi_turn,
             **kwargs,
         )
 
@@ -387,6 +406,8 @@ class LLM:
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: list[LoRARequest] | LoRARequest | None = None,
         priority: list[int] | None = None,
+        multi_turn_token_ids: list[list[list[int]]] | None = None,
+        turn_max_tokens: list[list[int]] | None = None,
     ) -> list[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -442,6 +463,8 @@ class LLM:
             use_tqdm=use_tqdm,
             lora_request=lora_request,
             priority=priority,
+            multi_turn_token_ids=multi_turn_token_ids,
+            turn_max_tokens=turn_max_tokens,
         )
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
@@ -1559,6 +1582,8 @@ class LLM:
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None,
         priority: list[int] | None = None,
+        multi_turn_token_ids: list[list[list[int]]] | None = None,
+        turn_max_tokens: list[list[int]] | None = None,
     ) -> None:
         if isinstance(prompts, (str, dict)):
             # Convert a single prompt to a list.
@@ -1576,6 +1601,22 @@ class LLM:
                 "The lengths of prompts "
                 f"({num_requests}) and priority ({len(priority)}) "
                 "must be the same."
+            )
+        if (
+            multi_turn_token_ids is not None
+            and len(multi_turn_token_ids) != num_requests
+        ):
+            raise ValueError(
+                "The lengths of prompts and multi_turn_token_ids must be "
+                f"the same (got {num_requests} vs {len(multi_turn_token_ids)})."
+            )
+        if (
+            turn_max_tokens is not None
+            and len(turn_max_tokens) != num_requests
+        ):
+            raise ValueError(
+                "The lengths of prompts and turn_max_tokens must be the "
+                f"same (got {num_requests} vs {len(turn_max_tokens)})."
             )
 
         for sp in params if isinstance(params, Sequence) else (params,):
@@ -1604,6 +1645,16 @@ class LLM:
                     if isinstance(lora_request, Sequence)
                     else lora_request,
                     priority=priority[i] if priority else 0,
+                    multi_turn_token_ids=(
+                        multi_turn_token_ids[i]
+                        if multi_turn_token_ids is not None
+                        else None
+                    ),
+                    turn_max_tokens=(
+                        turn_max_tokens[i]
+                        if turn_max_tokens is not None
+                        else None
+                    ),
                 )
                 added_request_ids.append(request_id)
         except Exception as e:
@@ -1667,6 +1718,8 @@ class LLM:
         *,
         lora_request: LoRARequest | None,
         priority: int,
+        multi_turn_token_ids: list[list[int]] | None = None,
+        turn_max_tokens: list[int] | None = None,
     ) -> tuple[EngineCoreRequest, dict[str, Any]]:
         """Use the Processor to process inputs for LLMEngine."""
         tokenization_kwargs: dict[str, Any] = {}
@@ -1683,6 +1736,8 @@ class LLM:
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
+            multi_turn_token_ids=multi_turn_token_ids,
+            turn_max_tokens=turn_max_tokens,
         )
         return engine_request, tokenization_kwargs
 
@@ -1692,6 +1747,8 @@ class LLM:
         params: SamplingParams | PoolingParams,
         lora_request: LoRARequest | None = None,
         priority: int = 0,
+        multi_turn_token_ids: list[list[int]] | None = None,
+        turn_max_tokens: list[int] | None = None,
     ) -> str:
         prompt_text, _, _ = get_prompt_components(prompt)
         request_id = str(next(self.request_counter))
@@ -1702,6 +1759,8 @@ class LLM:
             params,
             lora_request=lora_request,
             priority=priority,
+            multi_turn_token_ids=multi_turn_token_ids,
+            turn_max_tokens=turn_max_tokens,
         )
 
         self.llm_engine.add_request(

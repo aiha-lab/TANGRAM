@@ -238,8 +238,16 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Head-grouped paging needs contiguous Q/K/V for the decode fast
+        # path's single ``.view()``; the fused ``split(dim=-1)`` would
+        # produce non-contiguous slices, so use three matmuls instead.
+        if self.attn.num_groups_per_layer > 0:
+            q, k, v = self.qkv_proj.forward_split(hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
         q, k = self.rotary_emb(positions, q, k)
         if self.do_llama_4_scaling:
             attn_scale = self._get_llama_4_attn_scale(positions)

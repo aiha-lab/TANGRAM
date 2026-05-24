@@ -548,6 +548,17 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
 
+    # Head-group paging, compression, multi-turn.
+    page_group_size: int | None = CacheConfig.page_group_size
+    enable_compression: bool = CacheConfig.enable_compression
+    compression_ratio: float = CacheConfig.compression_ratio
+    compression_window_size: int = CacheConfig.compression_window_size
+    compression_n_sink_tokens: int = CacheConfig.compression_n_sink_tokens
+    compression_floor_min: int = CacheConfig.compression_floor_min
+    compression_chunk_size: int = CacheConfig.compression_chunk_size
+    compression_gate_path: str = CacheConfig.compression_gate_path
+    multi_turn: bool = CacheConfig.multi_turn
+
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
@@ -947,6 +958,36 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
+        # Head-group paging, compression, multi-turn.
+        cache_group.add_argument(
+            "--page-group-size", **cache_kwargs["page_group_size"]
+        )
+        cache_group.add_argument(
+            "--enable-compression", **cache_kwargs["enable_compression"]
+        )
+        cache_group.add_argument(
+            "--compression-ratio", **cache_kwargs["compression_ratio"]
+        )
+        cache_group.add_argument(
+            "--compression-window-size",
+            **cache_kwargs["compression_window_size"],
+        )
+        cache_group.add_argument(
+            "--compression-n-sink-tokens",
+            **cache_kwargs["compression_n_sink_tokens"],
+        )
+        cache_group.add_argument(
+            "--compression-floor-min",
+            **cache_kwargs["compression_floor_min"],
+        )
+        cache_group.add_argument(
+            "--compression-chunk-size",
+            **cache_kwargs["compression_chunk_size"],
+        )
+        cache_group.add_argument(
+            "--compression-gate-path", **cache_kwargs["compression_gate_path"]
+        )
+        cache_group.add_argument("--multi-turn", **cache_kwargs["multi_turn"])
 
         # Multimodal related configs
         multimodal_kwargs = get_kwargs(MultiModalConfig)
@@ -1365,6 +1406,14 @@ class EngineArgs:
         """
         current_platform.pre_register_and_update()
 
+        # Compression's per-layer pre-hook is incompatible with CUDA
+        # graph capture.
+        if self.enable_compression and not self.enforce_eager:
+            logger.info(
+                "Enabling enforce_eager (required by compression's "
+                "per-layer pre-hook).")
+            self.enforce_eager = True
+
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
 
         # Check if the model is a speculator and override model/tokenizer/config
@@ -1449,7 +1498,18 @@ class EngineArgs:
             mamba_block_size=self.mamba_block_size,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            page_group_size=self.page_group_size,
+            enable_compression=self.enable_compression,
+            compression_ratio=self.compression_ratio,
+            compression_window_size=self.compression_window_size,
+            compression_n_sink_tokens=self.compression_n_sink_tokens,
+            compression_floor_min=self.compression_floor_min,
+            compression_chunk_size=self.compression_chunk_size,
+            compression_gate_path=self.compression_gate_path,
+            multi_turn=self.multi_turn,
         )
+        # Populate head-count-derived fields and re-validate.
+        cache_config.derive_from_model(model_config)
 
         ray_runtime_env = None
         if is_ray_initialized():
@@ -1685,6 +1745,25 @@ class EngineArgs:
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
         )
+
+        # When compression is on, ``max_num_batched_tokens`` must equal
+        # ``compression_chunk_size`` so at most one request's chunk fits
+        # in a step. This rules out the co-batching scenarios (multi-req
+        # prefill+compress, mixed prefill+compress + decode) that would
+        # need extra cross-request bookkeeping.
+        if cache_config.enable_compression:
+            if (
+                scheduler_config.max_num_batched_tokens
+                != cache_config.compression_chunk_size
+            ):
+                raise ValueError(
+                    "When --enable-compression is set, "
+                    "--max-num-batched-tokens must equal "
+                    f"--compression-chunk-size. Got "
+                    f"max_num_batched_tokens="
+                    f"{scheduler_config.max_num_batched_tokens}, "
+                    f"compression_chunk_size="
+                    f"{cache_config.compression_chunk_size}.")
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
             raise ValueError(
@@ -2040,10 +2119,21 @@ class EngineArgs:
         orig_max_num_seqs = self.max_num_seqs
 
         if self.max_num_batched_tokens is None:
-            self.max_num_batched_tokens = default_max_num_batched_tokens.get(
-                usage_context,
-                SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS,
-            )
+            # With compression on, default ``max_num_batched_tokens`` to
+            # ``compression_chunk_size`` so at most one request's chunk
+            # fits in a step.
+            if self.enable_compression and self.compression_chunk_size:
+                self.max_num_batched_tokens = int(self.compression_chunk_size)
+                logger.debug(
+                    "enable_compression=True — defaulting "
+                    "max_num_batched_tokens to compression_chunk_size=%d.",
+                    self.max_num_batched_tokens,
+                )
+            else:
+                self.max_num_batched_tokens = default_max_num_batched_tokens.get(
+                    usage_context,
+                    SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS,
+                )
 
         if self.max_num_seqs is None:
             self.max_num_seqs = default_max_num_seqs.get(

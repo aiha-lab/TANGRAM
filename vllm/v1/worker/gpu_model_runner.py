@@ -42,6 +42,8 @@ from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
     get_tp_group,
     graph_capture,
     is_global_first_rank,
@@ -89,6 +91,11 @@ from vllm.utils.torch_utils import (
     supports_dynamo,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.compression import (
+    CompressionExecutor,
+    CompressionMetadata,
+    KVCompressor,
+)
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
@@ -105,6 +112,7 @@ from vllm.v1.kv_cache_interface import (
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
+    HeadGroupedAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -163,7 +171,11 @@ from .utils import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
-    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.core.sched.output import (
+        CompressionRequestMetadata,
+        GrammarOutput,
+        SchedulerOutput,
+    )
 
 logger = init_logger(__name__)
 
@@ -398,6 +410,23 @@ class GPUModelRunner(
         self.num_prompt_logprobs: dict[str, int] = {}
         self.comm_stream = torch.cuda.Stream()
 
+        # ``cache_config.num_head_groups*`` are model-global; the
+        # InputBatch / BlockTable need per-rank counts.
+        if self.cache_config.page_group_size is not None:
+            assert self.cache_config.num_hidden_layers is not None
+            num_kv_heads_per_rank = model_config.get_num_kv_heads(
+                parallel_config)
+            self._num_head_groups_per_layer_per_rank: int | None = (
+                num_kv_heads_per_rank // self.cache_config.page_group_size
+            )
+            self._num_head_groups_per_rank: int | None = (
+                self._num_head_groups_per_layer_per_rank
+                * self.cache_config.num_hidden_layers
+            )
+        else:
+            self._num_head_groups_per_layer_per_rank = None
+            self._num_head_groups_per_rank = None
+
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
         # `initialize_kv_cache` based on the kv cache config. However, as in
@@ -435,6 +464,24 @@ class GPUModelRunner(
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            # Per-rank head-group counts (see __init__ block above).
+            num_head_groups=self._num_head_groups_per_rank,
+            num_head_groups_per_layer=self._num_head_groups_per_layer_per_rank,
+        )
+
+        # Compression objects, populated in ``load_model`` when enabled.
+        self.compressor: KVCompressor | None = None
+        self.compression_executor: CompressionExecutor | None = None
+        # Per-step compression bookkeeping (cleared each compression step).
+        # Per-request freed-id chunks are concatenated + deduplicated in
+        # ``_postprocess_compress_updates``; the list-of-ndarray form
+        # avoids per-id set construction at the worker→scheduler boundary.
+        self.pending_eff_seq_lens: dict[str, np.ndarray] = {}
+        self.pending_freed_blocks: list[np.ndarray] = []
+        # Last step's results, exposed for scheduler fold-in.
+        self.last_compression_new_eff_seq_lens: dict[str, np.ndarray] = {}
+        self.last_compression_freed_block_ids: np.ndarray = np.empty(
+            0, dtype=np.int32
         )
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
@@ -717,7 +764,11 @@ class GPUModelRunner(
         # have low request overlap (e.g., alternating between two distinct
         # sets of requests), this optimization becomes very inefficient.
         for req_id in unscheduled_req_ids:
-            self.input_batch.remove_request(req_id)
+            # Pass cached state so the batch can stash eff_seq_lens onto
+            # the request for resume.
+            self.input_batch.remove_request(
+                req_id, cached_state=self.requests.get(req_id)
+            )
 
         reqs_to_add: list[CachedRequestState] = []
         # Add new requests to the cached states.
@@ -814,6 +865,23 @@ class GPUModelRunner(
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
+
+            # Multi-turn auto-advance: rebuild worker state when a
+            # finished turn has been absorbed into the prompt.
+            if req_id in req_data.advanced_turn_req_ids:
+                refreshed_token_ids = req_data.all_token_ids[req_id]
+                req_state.prompt_token_ids = list(refreshed_token_ids)
+                req_state.num_prompt_tokens = len(refreshed_token_ids)
+                req_state.output_token_ids = []
+                if req_index is not None:
+                    end_idx = len(refreshed_token_ids)
+                    self.input_batch.token_ids_cpu[req_index, :end_idx] = (
+                        refreshed_token_ids
+                    )
+                    self.input_batch.is_token_ids[req_index, :end_idx] = True
+                    self.input_batch.num_prompt_tokens[req_index] = end_idx
+                    self.input_batch.num_tokens[req_index] = end_idx
+                    self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             if not is_last_rank:
                 # When using PP, the scheduler sends the sampled tokens back,
@@ -1294,7 +1362,29 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+        # With compression active, KV writes target
+        # ``eff_seq_lens[group] + intra_seq_offset`` (which diverges from
+        # prompt position after eviction); build 2D positions
+        # ``[num_head_groups_total, T]`` instead of using the 1D path.
+        cache_cfg = self.cache_config
+        effective_seq_lens_cpu = self.input_batch.effective_seq_lens_cpu
+        use_effective_for_slot = (
+            getattr(cache_cfg, "enable_compression", False)
+            and cache_cfg.page_group_size is not None
+            and effective_seq_lens_cpu is not None
+        )
+        if use_effective_for_slot:
+            slot_positions = (
+                effective_seq_lens_cpu[req_indices].T.astype(np.int64)
+                + arange[None, :]
+            )
+            self.input_batch.block_table.compute_slot_mapping(
+                req_indices, slot_positions
+            )
+        else:
+            self.input_batch.block_table.compute_slot_mapping(
+                req_indices, positions_np
+            )
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
@@ -1522,11 +1612,35 @@ class GPUModelRunner(
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-                slot_mapping = blk_table.slot_mapping.gpu[:total_num_scheduled_tokens]
+                # Head-grouped: slot_mapping is 2D, slice token axis.
+                if blk_table.head_grouped:
+                    slot_mapping = blk_table.slot_mapping.gpu[
+                        :, :total_num_scheduled_tokens
+                    ]
+                    blk_table.slot_mapping.gpu[
+                        :, total_num_scheduled_tokens:
+                    ].fill_(-1)
+                else:
+                    slot_mapping = blk_table.slot_mapping.gpu[
+                        :total_num_scheduled_tokens
+                    ]
+                    # Fill unused with -1. Needed for reshape_and_cache in
+                    # full cuda graph mode.
+                    blk_table.slot_mapping.gpu[
+                        total_num_scheduled_tokens:
+                    ].fill_(-1)
 
-                # Fill unused with -1. Needed for reshape_and_cache in full cuda
-                # graph mode.
-                blk_table.slot_mapping.gpu[total_num_scheduled_tokens:].fill_(-1)
+            # Forward eff_seq_lens so ``seq_lens_grouped`` reflects the
+            # post-compression cache view.
+            effective_seq_lens_cpu_arg: np.ndarray | None = None
+            if (
+                getattr(self.cache_config, "enable_compression", False)
+                and self.cache_config.page_group_size is not None
+                and self.input_batch.effective_seq_lens_cpu is not None
+            ):
+                effective_seq_lens_cpu_arg = (
+                    self.input_batch.effective_seq_lens_cpu[:num_reqs]
+                )
 
             common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
@@ -1546,6 +1660,7 @@ class GPUModelRunner(
                 encoder_seq_lens=encoder_seq_lens,
                 dcp_local_seq_lens=dcp_local_seq_lens,
                 dcp_local_seq_lens_cpu=dcp_local_seq_lens_cpu,
+                effective_seq_lens_cpu=effective_seq_lens_cpu_arg,
             )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
@@ -2590,6 +2705,338 @@ class GPUModelRunner(
         finally:
             self.prepare_inputs_event.record()
 
+    def _init_compression(self) -> None:
+        """Build the compressor + executor and register per-layer gate
+        hooks. Called from ``load_model`` after the model is constructed.
+        ``cache_config.num_kv_heads`` is model-global; the compressor and
+        executor live per-rank.
+        """
+        cache_config = self.cache_config
+        assert cache_config.enable_compression
+        assert cache_config.page_group_size is not None
+        assert cache_config.num_kv_heads is not None
+        num_layers = cache_config.num_hidden_layers
+        assert num_layers is not None and num_layers > 0
+        head_size = self.model_config.get_head_size()
+        hidden_dim = self.model_config.get_hidden_size()
+        block_size = cache_config.block_size
+        dtype = self.dtype
+        num_kv_heads_total = cache_config.num_kv_heads
+        num_kv_heads_per_rank = self.model_config.get_num_kv_heads(
+            self.parallel_config)
+        tp_rank = get_tensor_model_parallel_rank()
+        if num_kv_heads_per_rank % cache_config.page_group_size != 0:
+            raise ValueError(
+                f"Compression: per-rank num_kv_heads ({num_kv_heads_per_rank}, "
+                f"from total {num_kv_heads_total} / tp_size "
+                f"{self.parallel_config.tensor_parallel_size}) must be a "
+                f"multiple of page_group_size ({cache_config.page_group_size})."
+            )
+
+        self.compressor = KVCompressor(
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads_per_rank,
+            page_group_size=cache_config.page_group_size,
+            head_size=head_size,
+            hidden_dim=hidden_dim,
+            block_size=block_size,
+            dtype=dtype,
+            device=self.device,
+        )
+        self.compressor.load_gate_checkpoint(
+            self.model_config.model,
+            cache_config.compression_gate_path,
+            num_kv_heads_total=num_kv_heads_total,
+            tp_rank=tp_rank,
+        )
+
+        # Hook the *outer* attention block (e.g. Qwen2Attention) so the
+        # pre-hook can read hidden_states; the inner ``Attention`` only
+        # sees already-projected q/k/v.
+        from vllm.attention import Attention as _InnerAttention
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        inner_attn_layers = get_layers_from_vllm_config(
+            self.vllm_config, _InnerAttention
+        )
+        layer_to_parent: dict[int, nn.Module] = {}
+        for layer_name in inner_attn_layers:
+            try:
+                idx = extract_layer_index(layer_name)
+            except (AssertionError, ValueError):
+                # Non-decoder attention (e.g. encoder-only).
+                continue
+            parts = layer_name.rsplit(".", 1)
+            if len(parts) != 2:
+                continue
+            parent_name = parts[0]
+            try:
+                parent = self.model.get_submodule(parent_name)
+            except AttributeError:
+                continue
+            layer_to_parent[idx] = parent
+
+        missing = [i for i in range(num_layers) if i not in layer_to_parent]
+        if missing:
+            raise RuntimeError(
+                f"Compression: outer attention parent missing for layers "
+                f"{missing}; one Attention per decoder layer is required."
+            )
+        parent_modules = [layer_to_parent[i] for i in range(num_layers)]
+        self.compressor.attach_to_attention_layers(parent_modules)
+
+        self.compression_executor = CompressionExecutor(
+            num_layers=num_layers,
+            num_kv_heads_per_layer=num_kv_heads_per_rank,
+            page_group_size=cache_config.page_group_size,
+            head_size=head_size,
+            block_size=block_size,
+        )
+
+    def _begin_compression_step(
+        self,
+        scheduler_output: "SchedulerOutput",
+        compression_metadata: dict[str, "CompressionRequestMetadata"],
+    ) -> None:
+        """Activate the compressor for this step. Computes each
+        compression-active request's token range in the upcoming forward's
+        ``hidden_states`` (prefix-sum over scheduled token counts) and
+        stashes them as ``pending_req_offsets`` for the per-layer pre-hook.
+        """
+        assert self.compressor is not None
+        if not compression_metadata:
+            return
+
+        req_ids = self.input_batch.req_ids
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        offsets: list[tuple[str, int, int]] = []
+        cursor = 0
+        for req_id in req_ids:
+            num_tokens = num_scheduled_tokens.get(req_id, 0)
+            if num_tokens <= 0:
+                continue
+            start = cursor
+            end = cursor + num_tokens
+            cursor = end
+            if req_id in compression_metadata:
+                offsets.append((req_id, start, end))
+
+        # First-chunk resets happen earlier in
+        # ``_pre_prepare_compression_reset``; this only adds fresh state.
+        for req_id in compression_metadata:
+            if req_id not in self.compressor.req_state:
+                self.compressor.begin_request(req_id)
+
+        self.compressor.compress_active = True
+        self.compressor.pending_req_offsets = offsets
+
+    def _pre_prepare_compression_reset(
+        self,
+        compression_metadata: dict[str, "CompressionRequestMetadata"],
+    ) -> None:
+        """Reset stale per-request state on the first chunk before
+        slot_mapping and attention metadata are built. On preempt-resume
+        the worker's ``effective_seq_lens_cpu`` and compressor
+        ``req_state`` carry pre-preempt accumulators; clearing here keeps
+        slot_mapping inside the fresh block range and prevents stale
+        scores from leaking into the cross-layer threshold. Idempotent
+        for fresh requests.
+        """
+        if not compression_metadata or self.compressor is None:
+            return
+        effective_seq_lens_cpu = self.input_batch.effective_seq_lens_cpu
+        for req_id, md in compression_metadata.items():
+            if md.chunk_in_sequence_idx != 0:
+                continue
+            if req_id in self.compressor.req_state:
+                self.compressor.end_request(req_id)
+            self.compressor.begin_request(req_id)
+            if effective_seq_lens_cpu is not None:
+                row = self.input_batch.req_id_to_index.get(req_id)
+                if row is not None:
+                    effective_seq_lens_cpu[row, :] = 0
+
+    def _run_compression_layer_loop(
+        self,
+        compression_metadata: dict[str, "CompressionRequestMetadata"],
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Drive ``executor.run_request`` once per compression-active
+        request. Each request reads shared ``effective_seq_lens`` and
+        ``block_table`` and writes its updates into ``pending_*`` for the
+        post-forward fold-in.
+        """
+        assert self.compressor is not None
+        assert self.compression_executor is not None
+        block_table = self.input_batch.block_table.block_tables[0]
+        eff_seq_lens_cpu = self.input_batch.effective_seq_lens_cpu
+        num_groups = self.compression_executor.num_head_groups_per_layer
+        num_layers = self.compression_executor.num_layers
+
+        tp_world_size = get_tensor_model_parallel_world_size()
+        tp_group = get_tp_group() if tp_world_size > 1 else None
+        tp_device = self.device if tp_world_size > 1 else None
+
+        for req_id, req_md in compression_metadata.items():
+            row_idx = self.input_batch.req_id_to_index[req_id]
+            chunk_len = scheduler_output.num_scheduled_tokens[req_id]
+            metadata = CompressionMetadata(
+                req_id=req_id,
+                row_idx=row_idx,
+                chunk_len=chunk_len,
+                floor_min=req_md.floor_min,
+            )
+
+            # Cross-layer KeepDecision; caches sorted indices + group
+            # scores for ``run_request``.
+            prev_seq_lens_per_layer = (
+                eff_seq_lens_cpu[row_idx, :]
+                .astype(np.int64, copy=True)
+                .reshape(num_layers, num_groups)
+            )
+            self.compressor.prepare_keep_decision(
+                req_id=req_id,
+                prev_seq_lens_per_layer=torch.from_numpy(
+                    prev_seq_lens_per_layer),
+                chunk_len=chunk_len,
+                ratio=req_md.compression_ratio,
+                window_size=req_md.window_size,
+                n_sink_tokens=req_md.n_sink_tokens,
+                total_prompt_tokens=req_md.total_prompt_tokens,
+            )
+
+            # Under TP, MAX-reduce kept_lengths across ranks so every
+            # worker frees the same block ids (the slot is shared across
+            # ranks for a given (req, layer, group_local)). No-op at TP=1.
+            kept_lengths_all = (
+                self.compressor.compute_kept_lengths_per_rank(
+                    req_id=req_id,
+                    eff_seq_lens_row=eff_seq_lens_cpu[row_idx, :],
+                    chunk_len=chunk_len,
+                    floor_min=req_md.floor_min,
+                )
+            )
+            if tp_world_size > 1:
+                kept_lengths_gpu = torch.from_numpy(
+                    kept_lengths_all).to(tp_device)
+                torch.distributed.all_reduce(
+                    kept_lengths_gpu,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=tp_group.device_group,
+                )
+                kept_lengths_all = (
+                    kept_lengths_gpu.cpu().numpy().astype(np.int32))
+                self.compressor.req_state[
+                    req_id].cached_kept_lengths_cpu = kept_lengths_all
+
+            self.compression_executor.run_request(
+                layer_kv_caches=self.kv_caches,
+                block_table=block_table,
+                eff_seq_lens_cpu=eff_seq_lens_cpu,
+                compressor=self.compressor,
+                compression_metadata=metadata,
+            )
+            self.pending_eff_seq_lens[req_id] = (
+                kept_lengths_all.reshape(-1))
+
+            # Batched compact: one numpy scan over all (layer, group)
+            # pairs instead of one Python call per layer.
+            block_size = self.compression_executor.block_size
+            new_num_blocks_per_layer = (
+                (kept_lengths_all + block_size - 1) // block_size
+            ).astype(np.int32)
+            freed = block_table.compact_after_compress_all_layers(
+                row_idx=row_idx,
+                num_head_groups_per_layer=num_groups,
+                new_num_blocks_per_layer=new_num_blocks_per_layer,
+            )
+            if freed.size:
+                self.pending_freed_blocks.append(freed)
+
+    def _postprocess_compress_updates(
+        self,
+    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        """Fold pending compression results into the input batch.
+
+        eff_seq_lens becomes the next step's source of truth; freed
+        block ids are returned for the scheduler to release.
+        """
+        for req_id, eff_lens in self.pending_eff_seq_lens.items():
+            row = self.input_batch.req_id_to_index.get(req_id)
+            if row is None:
+                # Request was removed in the same step — drop silently;
+                # its KV is already on its way back to the pool.
+                continue
+            self.input_batch.effective_seq_lens_cpu[row, :] = eff_lens
+
+        new_eff_seq_lens = dict(self.pending_eff_seq_lens)
+        if self.pending_freed_blocks:
+            # ``np.unique`` sorts + deduplicates in one C-level pass —
+            # the dedup keeps the post-condition of the old set-based
+            # path (no id reported twice to ``free_blocks_by_ids``).
+            freed_block_ids = np.unique(
+                np.concatenate(self.pending_freed_blocks)
+            )
+        else:
+            freed_block_ids = np.empty(0, dtype=np.int32)
+        self.pending_eff_seq_lens.clear()
+        self.pending_freed_blocks.clear()
+        return new_eff_seq_lens, freed_block_ids
+
+    def _end_compression_step(self) -> None:
+        """Clear the compress-active flag."""
+        if self.compressor is None:
+            return
+        self.compressor.compress_active = False
+        self.compressor.pending_req_offsets = None
+
+    @contextmanager
+    def _compression_step(self, scheduler_output, compression_metadata):
+        """Compression-active context for one step. Yields True when
+        compression runs this step (caller should then invoke the
+        post-forward loop), False otherwise. ``_end_compression_step``
+        always fires on exit, even on exception.
+        """
+        active = bool(compression_metadata)
+        if active:
+            assert self.compressor is not None, (
+                "scheduler emitted compression_metadata but the runner has "
+                "no KVCompressor; cache_config.enable_compression must be set."
+            )
+            self._begin_compression_step(scheduler_output, compression_metadata)
+        try:
+            yield active
+        finally:
+            if active:
+                self._end_compression_step()
+
+    def _build_effective_seq_lens_increments(
+        self,
+        num_scheduled_tokens: dict,
+        exclude: dict | None = None,
+    ) -> np.ndarray | None:
+        """Per-row increments for the post-forward
+        ``effective_seq_lens_cpu`` update. Returns ``None`` when no row
+        is active.
+        """
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            return None
+        tokens_per_row = np.zeros(num_reqs, dtype=np.int32)
+        req_id_to_index = self.input_batch.req_id_to_index
+        any_active = False
+        for req_id, num_tokens in num_scheduled_tokens.items():
+            if num_tokens <= 0:
+                continue
+            if exclude is not None and req_id in exclude:
+                continue
+            row = req_id_to_index.get(req_id)
+            if row is None:
+                continue
+            tokens_per_row[row] = num_tokens
+            any_active = True
+        return tokens_per_row if any_active else None
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -2648,6 +3095,12 @@ class GPUModelRunner(
         ):
             scheduler_output = deepcopy(scheduler_output)
 
+        # Clear last step's compression results; they remain non-empty
+        # across the step so external probes see them after
+        # ``llm.generate`` returns.
+        self.last_compression_new_eff_seq_lens = {}
+        self.last_compression_freed_block_ids = np.empty(0, dtype=np.int32)
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
             with self.synchronize_input_prep():
@@ -2693,6 +3146,15 @@ class GPUModelRunner(
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+
+                # Preempt-resume: reset stale per-request state before
+                # slot_mapping and attention metadata are built.
+                early_compression_metadata = (
+                    getattr(scheduler_output, "compression_metadata", {}) or {}
+                )
+                if early_compression_metadata and self.compressor is not None:
+                    self._pre_prepare_compression_reset(
+                        early_compression_metadata)
 
                 (
                     logits_indices,
@@ -2777,28 +3239,76 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
-        # Run the model.
-        # Use persistent buffers for CUDA graphs.
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_descriptor,
-                ubatch_slices=ubatch_slices,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+        # Compressor stays active across forward + post-forward loop so
+        # the gate pre-hook can stash scores during forward; state is
+        # auto-cleared on context exit even if either raises.
+        compression_metadata: dict[str, "CompressionRequestMetadata"] = (
+            getattr(scheduler_output, "compression_metadata", {}) or {}
+        )
+
+        with self._compression_step(
+                scheduler_output, compression_metadata) as do_compression:
+            # Run the model. Use persistent buffers for CUDA graphs.
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_input_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_descriptor,
+                    ubatch_slices=ubatch_slices,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output) as kv_connector_output,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+
+            # Post-forward: cache reorder per layer, then fold
+            # eff_seq_lens / freed blocks into the input batch. Touches
+            # cache memory only — this step's attention is already done.
+            if do_compression:
+                with record_function_or_nullcontext(
+                        "gpu_model_runner: compression"):
+                    self._run_compression_layer_loop(
+                        compression_metadata, scheduler_output)
+                    new_eff, freed = self._postprocess_compress_updates()
+                    self.last_compression_new_eff_seq_lens = new_eff
+                    self.last_compression_freed_block_ids = freed
+                    # In a mixed step the fold-in sets eff_seq_lens only
+                    # for compression rows; non-compression rows still
+                    # need their per-row scheduled tokens added so the
+                    # next step's slot_mapping advances past their writes.
+                    effective_seq_lens_cpu = (
+                        self.input_batch.effective_seq_lens_cpu)
+                    if effective_seq_lens_cpu is not None:
+                        increments = (
+                            self._build_effective_seq_lens_increments(
+                                scheduler_output.num_scheduled_tokens,
+                                exclude=compression_metadata))
+                        if increments is not None:
+                            effective_seq_lens_cpu[
+                                :self.input_batch.num_reqs] += (
+                                    increments[:, None])
+            else:
+                # Advance ``effective_seq_lens_cpu`` by the per-row
+                # scheduled token count so the next step's slot_mapping
+                # and ``seq_lens_grouped`` see the post-write cache view.
+                effective_seq_lens_cpu = (
+                    self.input_batch.effective_seq_lens_cpu)
+                if effective_seq_lens_cpu is not None:
+                    increments = self._build_effective_seq_lens_increments(
+                        scheduler_output.num_scheduled_tokens)
+                    if increments is not None:
+                        effective_seq_lens_cpu[
+                            :self.input_batch.num_reqs] += increments[:, None]
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -2869,6 +3379,7 @@ class GPUModelRunner(
             ec_connector_output,
         )
         self.kv_connector_output = kv_connector_output
+
         return None
 
     @torch.inference_mode
@@ -3005,6 +3516,20 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
+        # Surface this step's compression results for the scheduler.
+        compression_new_eff_seq_lens_payload: dict[str, list[int]] | None = None
+        compression_freed_block_ids_payload: np.ndarray | None = None
+        if self.last_compression_new_eff_seq_lens:
+            compression_new_eff_seq_lens_payload = {
+                req_id: arr.tolist()
+                for req_id, arr in self.last_compression_new_eff_seq_lens.items()
+            }
+            # Sorted + deduplicated upstream in
+            # ``_postprocess_compress_updates``.
+            compression_freed_block_ids_payload = (
+                self.last_compression_freed_block_ids
+            )
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -3018,6 +3543,8 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
+                compression_new_eff_seq_lens=compression_new_eff_seq_lens_payload,
+                compression_freed_block_ids=compression_freed_block_ids_payload,
             )
 
         if not self.use_async_scheduling:
@@ -3345,6 +3872,13 @@ class GPUModelRunner(
             scope="local",
         )
         prepare_communication_buffer_for_model(self.model)
+
+        # Build compressor + executor and wire per-layer gate pre-hooks
+        # before cudagraph wrapping so hooks attach to plain
+        # ``nn.Module`` instances.
+        if self.cache_config.enable_compression:
+            self._init_compression()
+
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
@@ -4713,6 +5247,11 @@ class GPUModelRunner(
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
                 num_speculative_tokens=self.num_spec_tokens,
+                # Per-rank head-group counts (see __init__).
+                num_head_groups=self._num_head_groups_per_rank,
+                num_head_groups_per_layer=(
+                    self._num_head_groups_per_layer_per_rank
+                ),
             )
 
     def _allocate_kv_cache_tensors(
@@ -4839,10 +5378,17 @@ class GPUModelRunner(
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
+                    # Head-grouped paging stores ``page_group_size`` KV
+                    # heads per block instead of the layer's full
+                    # ``num_kv_heads``.
+                    if isinstance(kv_cache_spec, HeadGroupedAttentionSpec):
+                        per_block_kv_heads = kv_cache_spec.page_group_size
+                    else:
+                        per_block_kv_heads = kv_cache_spec.num_kv_heads
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
                         kernel_block_size,
-                        kv_cache_spec.num_kv_heads,
+                        per_block_kv_heads,
                         kv_cache_spec.head_size,
                         cache_dtype_str=self.cache_config.cache_dtype,
                     )

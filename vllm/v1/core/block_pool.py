@@ -3,6 +3,8 @@
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+import numpy as np
+
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -134,6 +136,12 @@ class BlockPool:
         num_gpu_blocks: The number of blocks in the pool.
         enable_caching: Whether to enable prefix caching.
         enable_kv_cache_events: Whether to enable kv cache events.
+        head_grouped: Whether the pool is feeding head-grouped paging.
+            Informational only — every block is byte-equal and head-group
+            agnostic; this flag switches storage to a numpy ring buffer.
+        num_head_groups: Total head-groups across all layers
+            (= ``num_head_groups_per_layer * num_layers``); required when
+            ``head_grouped`` is True.
     """
 
     def __init__(
@@ -141,27 +149,58 @@ class BlockPool:
         num_gpu_blocks: int,
         enable_caching: bool,
         enable_kv_cache_events: bool = False,
+        head_grouped: bool = False,
+        num_head_groups: int | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+        if head_grouped:
+            assert num_head_groups is not None and num_head_groups > 0, (
+                "head_grouped=True requires a positive num_head_groups."
+            )
+        else:
+            assert num_head_groups is None, (
+                "num_head_groups must be None when head_grouped=False."
+            )
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
+        self.head_grouped = head_grouped
+        self.num_head_groups = num_head_groups
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # Doubly linked list of free blocks (eviction candidates when
+        # caching is on). Head-grouped paging swaps this for an int32 ring
+        # buffer (see ``free_block_ids``) so alloc/free can run as bulk
+        # numpy ops; prefix caching is disabled there, removing the only
+        # consumer of mid-list removal.
+        if head_grouped:
+            # Block 0 is reserved as the null block; ring holds ids 1..N-1.
+            self.free_block_queue: FreeKVCacheBlockQueue | None = None
+            self.free_block_ids: np.ndarray = np.arange(
+                1, num_gpu_blocks, dtype=np.int32
+            )
+            self._ring_capacity: int = num_gpu_blocks - 1
+            self._ring_head: int = 0
+            # Position one past the last live entry; wraps to 0 on append.
+            self._ring_tail: int = self._ring_capacity
+            self.num_free_blocks: int = self._ring_capacity
+            # Mirror of per-block ref_cnt for hot-path bulk ops; the
+            # per-block ``KVCacheBlock.ref_cnt`` is left untouched and
+            # never read in this mode.
+            self.ref_cnts: np.ndarray = np.zeros(num_gpu_blocks, dtype=np.int8)
+            self.null_block = self.blocks[0]
+            self.null_block.is_null = True
+        else:
+            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+            # To represent a placeholder block with block_id=0.
+            # The ref_cnt of null_block is not maintained, needs special care
+            # to avoid freeing it.
+            self.null_block = self.free_block_queue.popleft()
+            self.null_block.is_null = True
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
-
-        # To represent a placeholder block with block_id=0.
-        # The ref_cnt of null_block is not maintained, needs special care to
-        # avoid freeing it.
-        self.null_block = self.free_block_queue.popleft()
-        self.null_block.is_null = True
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
@@ -266,6 +305,62 @@ class BlockPool:
                 )
             )
 
+    def _ring_pop_ids(self, num_blocks: int) -> np.ndarray:
+        """Pop ``num_blocks`` ids from the head-grouped ring buffer.
+
+        Caller must ensure ``num_free_blocks >= num_blocks``.
+        """
+        head = self._ring_head
+        capacity = self._ring_capacity
+        if head + num_blocks <= capacity:
+            ids = self.free_block_ids[head : head + num_blocks].copy()
+            new_head = head + num_blocks
+        else:
+            first = capacity - head
+            ids = np.empty(num_blocks, dtype=np.int32)
+            ids[:first] = self.free_block_ids[head:]
+            ids[first:] = self.free_block_ids[: num_blocks - first]
+            new_head = num_blocks - first
+        self._ring_head = new_head % capacity
+        self.num_free_blocks -= num_blocks
+        return ids
+
+    def _ring_append_ids(self, ids: np.ndarray) -> None:
+        """Push ``ids`` into the ring buffer (FIFO; order is irrelevant
+        since head-grouped mode has no LRU invariant)."""
+        num = ids.size
+        if num == 0:
+            return
+        tail = self._ring_tail
+        capacity = self._ring_capacity
+        if tail + num <= capacity:
+            self.free_block_ids[tail : tail + num] = ids
+            new_tail = tail + num
+        else:
+            first = capacity - tail
+            self.free_block_ids[tail:] = ids[:first]
+            self.free_block_ids[: num - first] = ids[first:]
+            new_tail = num - first
+        self._ring_tail = new_tail % capacity
+        self.num_free_blocks += num
+
+    def get_new_block_ids(self, num_blocks: int) -> np.ndarray:
+        """Head-grouped fast path: int32 ndarray of newly-allocated ids.
+
+        Bulk-updates ``ref_cnts`` in one numpy op and skips
+        ``KVCacheBlock`` materialisation entirely.
+        """
+        assert self.head_grouped
+        if num_blocks > self.num_free_blocks:
+            raise ValueError(
+                f"Cannot get {num_blocks} free blocks from the pool"
+            )
+        if num_blocks == 0:
+            return np.empty(0, dtype=np.int32)
+        ids = self._ring_pop_ids(num_blocks)
+        self.ref_cnts[ids] = 1
+        return ids
+
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -277,6 +372,16 @@ class BlockPool:
         Returns:
             A list of new block.
         """
+        if self.head_grouped:
+            # Materialise from the ring buffer for callers still expecting
+            # ``list[KVCacheBlock]``; the head-grouped manager uses
+            # ``get_new_block_ids`` directly and skips this list build.
+            ids = self.get_new_block_ids(num_blocks)
+            if ids.size == 0:
+                return []
+            pool_blocks = self.blocks
+            return [pool_blocks[int(bid)] for bid in ids.tolist()]
+
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
@@ -338,6 +443,11 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        # Head-grouped paging force-disables prefix caching; surface any
+        # accidental call rather than silently corrupting ref_cnts.
+        assert not self.head_grouped, (
+            "BlockPool.touch is not supported under head-grouped paging."
+        )
         for blocks_per_group in blocks:
             for block in blocks_per_group:
                 # ref_cnt=0 means this block is in the free list (i.e. eviction
@@ -345,6 +455,18 @@ class BlockPool:
                 if block.ref_cnt == 0 and not block.is_null:
                     self.free_block_queue.remove(block)
                 block.ref_cnt += 1
+
+    def free_block_ids_array(self, ids: np.ndarray) -> None:
+        """Head-grouped fast path: bulk-push int32 ids back into the ring
+        buffer. Caller must guarantee ids are unique and exclude the null
+        block (id 0); pushing the same id twice would corrupt
+        ``num_free_blocks``.
+        """
+        assert self.head_grouped
+        if ids.size == 0:
+            return
+        self.ref_cnts[ids] = 0
+        self._ring_append_ids(ids)
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
@@ -354,6 +476,17 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
+        if self.head_grouped:
+            # Manager bookkeeping is the authority here; only called on
+            # request termination. Build an id ndarray, skip null, push.
+            ids_list = [
+                blk.block_id for blk in ordered_blocks if not blk.is_null
+            ]
+            if not ids_list:
+                return
+            ids = np.fromiter(ids_list, dtype=np.int32, count=len(ids_list))
+            self.free_block_ids_array(ids)
+            return
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
@@ -361,6 +494,46 @@ class BlockPool:
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
+
+    def free_by_block_ids(self, block_ids: Iterable[int]) -> None:
+        """Force-free physical block ids after compression resolved that no
+        request still references them. Resets ``ref_cnt`` to 0 directly
+        (not via ``free_blocks``) and returns them to the free pool.
+        """
+        if self.head_grouped:
+            if isinstance(block_ids, np.ndarray):
+                arr = block_ids.astype(np.int32, copy=False)
+            else:
+                arr = np.fromiter(block_ids, dtype=np.int32,
+                                  count=len(block_ids))
+            if arr.size == 0:
+                return
+            # Drop null id 0 and any id already at ref_cnt 0 (another layer
+            # may have reported the same id in this step).
+            live = (arr != 0) & (self.ref_cnts[arr] != 0)
+            if not live.all():
+                arr = arr[live]
+                if arr.size == 0:
+                    return
+            self.free_block_ids_array(arr)
+            return
+        seen: set[int] = set()
+        to_append: list[KVCacheBlock] = []
+        for bid in block_ids:
+            ibid = int(bid)
+            if ibid in seen:
+                continue
+            seen.add(ibid)
+            block = self.blocks[ibid]
+            if block.is_null:
+                continue
+            if block.ref_cnt == 0:
+                # Already freed by another layer reporting the same id.
+                continue
+            block.ref_cnt = 0
+            to_append.append(block)
+        if to_append:
+            self.free_block_queue.append_n(to_append)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -400,6 +573,8 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
+        if self.head_grouped:
+            return self.num_free_blocks
         return self.free_block_queue.num_free_blocks
 
     def get_usage(self) -> float:

@@ -72,6 +72,13 @@ class EngineCoreRequest(
 
     trace_headers: Mapping[str, str] | None = None
 
+    # Multi-turn: ``multi_turn_token_ids[0]`` is turn 0 (must equal
+    # ``prompt_token_ids``); later entries are subsequent turns'
+    # user-input tokens. ``turn_max_tokens`` is an optional per-turn
+    # ``max_tokens`` override of the same length.
+    multi_turn_token_ids: list[list[int]] | None = None
+    turn_max_tokens: list[int] | None = None
+
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""
@@ -126,6 +133,10 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+
+    # Multi-turn: per-turn output token ids, populated only when the
+    # request has finished. Length equals ``num_turns``.
+    turn_output_token_ids: list[list[int]] | None = None
 
     @property
     def finished(self) -> bool:

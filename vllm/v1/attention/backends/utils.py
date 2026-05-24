@@ -95,6 +95,14 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
+    # Head-grouped + compression: per-(req, head-group) cache occupancy
+    # post-compression. Feeds ``seq_lens_grouped`` so the paged-attention
+    # kernels see the actual cache window (smaller than
+    # ``num_computed_tokens + num_scheduled`` after eviction).
+    # Shape ``[num_reqs, num_head_groups_total]`` int32 on CPU; ``None``
+    # when compression is off.
+    effective_seq_lens_cpu: np.ndarray | None = None
+
 
 def slice_query_start_locs(
     query_start_loc: torch.Tensor,

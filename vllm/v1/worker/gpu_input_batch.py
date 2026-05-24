@@ -49,6 +49,11 @@ class CachedRequestState:
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0
 
+    # Head-grouped paging: per-(layer, head-group) sequence-length snapshot
+    # held only while the request is out of the InputBatch (the batch row
+    # is otherwise the source of truth). None when head-group paging is off.
+    eff_seq_lens_snapshot: np.ndarray | None = None
+
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds
@@ -88,6 +93,8 @@ class InputBatch:
         is_pooling_model: bool = False,
         num_speculative_tokens: int = 0,
         cp_kv_cache_interleave_size: int = 1,
+        num_head_groups: int | None = None,
+        num_head_groups_per_layer: int | None = None,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -131,6 +138,27 @@ class InputBatch:
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
 
+        # Head-grouped paging: per-(req, head-group) effective sequence
+        # lengths feeding allocate_slots and slot_mapping. ``num_head_groups``
+        # is the total (per_layer × layers); the layer dimension is folded
+        # into the flat group index.
+        self.num_head_groups = num_head_groups
+        self.num_head_groups_per_layer = num_head_groups_per_layer
+        self.head_grouped = num_head_groups is not None
+        if self.head_grouped:
+            assert num_head_groups is not None and num_head_groups > 0
+            if num_head_groups_per_layer is not None:
+                assert num_head_groups_per_layer > 0
+                assert num_head_groups % num_head_groups_per_layer == 0, (
+                    f"num_head_groups ({num_head_groups}) must be divisible "
+                    f"by num_head_groups_per_layer "
+                    f"({num_head_groups_per_layer}).")
+            self.effective_seq_lens_cpu = np.zeros(
+                (max_num_reqs, num_head_groups), dtype=np.int32
+            )
+        else:
+            self.effective_seq_lens_cpu = None
+
         # Block table.
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,
@@ -142,6 +170,8 @@ class InputBatch:
             kernel_block_sizes=kernel_block_sizes,
             num_speculative_tokens=num_speculative_tokens,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            num_head_groups=num_head_groups,
+            num_head_groups_per_layer=num_head_groups_per_layer,
         )
 
         # Sampling-related.
@@ -339,6 +369,23 @@ class InputBatch:
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
         self.block_table.add_row(request.block_ids, req_index)
 
+        # Hand any out-of-batch snapshot back to the batch row, then clear
+        # the request-side mirror; first-time entries start at zero.
+        if self.head_grouped:
+            assert self.effective_seq_lens_cpu is not None
+            if request.eff_seq_lens_snapshot is not None:
+                assert request.eff_seq_lens_snapshot.shape == (
+                    self.num_head_groups,), (
+                    f"eff_seq_lens_snapshot shape "
+                    f"{request.eff_seq_lens_snapshot.shape} does not match "
+                    f"num_head_groups ({self.num_head_groups}).")
+                self.effective_seq_lens_cpu[req_index, :] = (
+                    request.eff_seq_lens_snapshot
+                )
+                request.eff_seq_lens_snapshot = None
+            else:
+                self.effective_seq_lens_cpu[req_index, :] = 0
+
         if sampling_params := request.sampling_params:
             if self.is_spec_decode and is_spec_decode_unsupported(sampling_params):
                 self.spec_decode_unsupported_reqs.add(req_id)
@@ -436,11 +483,19 @@ class InputBatch:
 
         return req_index
 
-    def remove_request(self, req_id: str) -> int | None:
+    def remove_request(
+        self,
+        req_id: str,
+        cached_state: "CachedRequestState | None" = None,
+    ) -> int | None:
         """This method must always be followed by a call to condense().
 
         Args:
           req_id: request to remove
+          cached_state: Head-grouped paging only — the runner-side
+              ``CachedRequestState`` to receive an ``eff_seq_lens`` snapshot
+              before the row is cleared. ``None`` for finished requests
+              whose cached state has already been popped.
 
         Returns:
           Removed request index, or `None` if `req_id` not recognized
@@ -449,6 +504,16 @@ class InputBatch:
         req_index = self.req_id_to_index.pop(req_id, None)
         if req_index is None:
             return None
+
+        # Snapshot eff_seq_lens for resume; only requested for
+        # unscheduled / preempted requests (finished requests' cached
+        # state is already popped).
+        if self.head_grouped and cached_state is not None:
+            assert self.effective_seq_lens_cpu is not None
+            cached_state.eff_seq_lens_snapshot = self.effective_seq_lens_cpu[
+                req_index, :
+            ].copy()
+            self.effective_seq_lens_cpu[req_index, :] = 0
 
         self.batch_update_builder.removed_append(req_index)
         self._req_ids[req_index] = None
@@ -546,6 +611,13 @@ class InputBatch:
             self.req_prompt_embeds.pop(i1, None)
 
         self.block_table.swap_row(i1, i2)
+
+        # Keep eff_seq_lens rows aligned with batch indices.
+        if self.head_grouped:
+            assert self.effective_seq_lens_cpu is not None
+            tmp = self.effective_seq_lens_cpu[i1, :].copy()
+            self.effective_seq_lens_cpu[i1, :] = self.effective_seq_lens_cpu[i2, :]
+            self.effective_seq_lens_cpu[i2, :] = tmp
 
         self.request_lora_mapping[i1], self.request_lora_mapping[i2] = (
             self.request_lora_mapping[i2],
@@ -674,6 +746,14 @@ class InputBatch:
                 last_req_index
             ]
             self.block_table.move_row(last_req_index, empty_index)
+
+            # Move the eff_seq_lens row alongside.
+            if self.head_grouped:
+                assert self.effective_seq_lens_cpu is not None
+                self.effective_seq_lens_cpu[empty_index, :] = (
+                    self.effective_seq_lens_cpu[last_req_index, :]
+                )
+                self.effective_seq_lens_cpu[last_req_index, :] = 0
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
                 last_req_index

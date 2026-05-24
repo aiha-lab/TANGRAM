@@ -44,6 +44,8 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        multi_turn_token_ids: list[list[int]] | None = None,
+        turn_max_tokens: list[int] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -82,10 +84,23 @@ class Request:
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
-        self.prompt_token_ids = prompt_token_ids
+        # Multi-turn: ``multi_turn_token_ids[0]`` is turn 0's prompt and
+        # must be a mutable list so ``advance_to_next_turn`` can extend
+        # it in place. The caller ensures it matches ``prompt_token_ids``.
+        if multi_turn_token_ids is not None:
+            assert len(multi_turn_token_ids) >= 1, (
+                "multi_turn_token_ids must contain at least one turn."
+            )
+            assert prompt_embeds is None, (
+                "multi-turn requests cannot use prompt_embeds; pass token "
+                "ids via multi_turn_token_ids instead."
+            )
+            self.prompt_token_ids = list(multi_turn_token_ids[0])
+        else:
+            self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            prompt_token_ids, prompt_embeds
+            self.prompt_token_ids, prompt_embeds
         )
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
@@ -132,6 +147,46 @@ class Request:
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
+        # Scheduler-side mirror of post-compression cache occupancy. Set
+        # to the kept length after each compression-active prefill step,
+        # then incremented by ``num_scheduled`` on non-compression steps.
+        # The scheduler uses this instead of ``num_computed_tokens`` to
+        # size ``allocate_slots``. ``None`` for non-compression requests.
+        self.compress_max_eff_seq_len: int | None = None
+
+        # Once-only compression: True (sticky) once the initial prefill
+        # cycle finishes; the scheduler then stops emitting compression
+        # metadata for this request.
+        self.compression_done: bool = False
+
+        # Multi-turn auto-advance. When ``multi_turn_token_ids`` is set,
+        # it carries the per-turn user-input tokens for the whole
+        # conversation; ``multi_turn_token_ids[0]`` must equal
+        # ``prompt_token_ids``. ``None`` keeps the base single-turn path.
+        self.multi_turn_token_ids: list[list[int]] | None = multi_turn_token_ids
+        self.turn_max_tokens: list[int] | None = turn_max_tokens
+        self.current_turn: int = 0
+        self.num_turns: int = (
+            len(multi_turn_token_ids) if multi_turn_token_ids is not None else 1
+        )
+        # Filled by ``advance_to_next_turn``; the scheduler appends the
+        # final turn's output before freeing the request.
+        self.turn_output_token_ids: list[list[int]] = []
+        # Set by ``advance_to_next_turn``; scheduler reads + clears.
+        self.just_advanced_to_next_turn: bool = False
+        # Turn 0's ``max_tokens`` override; later turns are applied on
+        # advance.
+        if (
+            turn_max_tokens is not None
+            and multi_turn_token_ids is not None
+            and pooling_params is None
+        ):
+            assert len(turn_max_tokens) == len(multi_turn_token_ids), (
+                "turn_max_tokens must have the same length as "
+                "multi_turn_token_ids."
+            )
+            self.max_tokens = turn_max_tokens[0]
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -153,6 +208,8 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            multi_turn_token_ids=request.multi_turn_token_ids,
+            turn_max_tokens=request.turn_max_tokens,
         )
 
     def append_output_token_ids(
@@ -203,6 +260,54 @@ class Request:
 
     def get_finished_reason(self) -> FinishReason | None:
         return RequestStatus.get_finished_reason(self.status)
+
+    def absorb_output_into_prompt(self) -> None:
+        """Promote sampled output tokens into the prompt prefix.
+
+        Used at multi-turn transitions (next turn's prefill must reattend
+        the previous turn's output) and on preempt under compression
+        (cache is gone; already-sampled tokens are re-prefilled).
+        Clears ``_output_token_ids`` and extends ``prompt_token_ids``;
+        ``_all_token_ids`` already contains the output tokens and stays
+        unchanged.
+        """
+        if not self._output_token_ids:
+            return
+        assert self.prompt_token_ids is not None
+        self.prompt_token_ids.extend(self._output_token_ids)
+        self._output_token_ids.clear()
+        self.num_prompt_tokens = len(self.prompt_token_ids)
+
+    def advance_to_next_turn(self) -> bool:
+        """Multi-turn auto-advance. Called from ``check_stop`` when the
+        current turn's stop conditions fire.
+
+        Snapshots the just-finished turn's output, absorbs it into
+        ``prompt_token_ids``, appends the next turn's user tokens, and
+        updates ``current_turn`` / ``max_tokens``. The KV cache stays
+        live so the next step resumes chunked prefill of the appended
+        tokens. Returns False on the final turn (caller should finish).
+        """
+        if self.multi_turn_token_ids is None:
+            return False
+        if self.current_turn >= self.num_turns - 1:
+            return False
+        self.turn_output_token_ids.append(list(self._output_token_ids))
+        # Full conversation history is retained so output is byte-equal
+        # to base vLLM running the concatenated prompt in one shot.
+        self.absorb_output_into_prompt()
+        self.current_turn += 1
+        next_user_tokens = self.multi_turn_token_ids[self.current_turn]
+        self.prompt_token_ids.extend(next_user_tokens)
+        # ``_all_token_ids`` already has the just-finished turn's output;
+        # only append the new user tokens.
+        self._all_token_ids.extend(next_user_tokens)
+        self.num_prompt_tokens = len(self.prompt_token_ids)
+        if self.turn_max_tokens is not None:
+            self.max_tokens = self.turn_max_tokens[self.current_turn]
+        # Scheduler reads + clears this on the next step.
+        self.just_advanced_to_next_turn = True
+        return True
 
     def get_num_encoder_tokens(self, input_id: int) -> int:
         assert input_id < len(self.mm_features)

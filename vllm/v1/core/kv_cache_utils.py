@@ -18,6 +18,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
+    HeadGroupedAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -787,6 +788,11 @@ def get_max_concurrency_for_kv_cache_config(
         * num_layer_per_group
     )
     num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
+    # Head-grouped paging shares a global pool, so the per-request footprint
+    # scales with the number of layers in the group.
+    spec0 = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    if isinstance(spec0, HeadGroupedAttentionSpec):
+        num_block_per_request *= num_layer_per_group
     max_concurrency = kv_cache_config.num_blocks / num_block_per_request
     return max_concurrency
 
@@ -819,7 +825,12 @@ def get_num_blocks(
         available_memory: Memory available for KV cache in bytes.
         page_size: The page size of the KV cache.
     """
-    num_blocks = int(available_memory // page_size // num_layers)
+    # Head-grouped paging uses a single global block pool spanning every
+    # layer; the pool is sized against total memory rather than per-layer.
+    if vllm_config.cache_config.page_group_size is not None:
+        num_blocks = int(available_memory // page_size)
+    else:
+        num_blocks = int(available_memory // page_size // num_layers)
     num_blocks = max(num_blocks, 0)
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     return num_blocks
@@ -1053,7 +1064,21 @@ def get_kv_cache_config_from_groups(
         # (sw.1, padding) will be: (group_size = 2)
         # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
         # full.1, sw.2: share another Tensor with size=available_memory//2
-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
+
+        # Head-grouped paging: all attention layers share a single raw KV
+        # tensor; layers are separated by disjoint block_ids in the
+        # BlockTable rather than by owning their own raw tensor.
+        head_grouped = any(
+            isinstance(group.kv_cache_spec, HeadGroupedAttentionSpec)
+            for group in kv_cache_groups
+        )
+        if head_grouped:
+            assert len(kv_cache_groups) == 1, (
+                "Head-grouped paging requires a single KVCacheGroupSpec; "
+                f"got {len(kv_cache_groups)}.")
+            group_size = 1
+        else:
+            group_size = max(len(group.layer_names) for group in kv_cache_groups)
 
         page_size = get_uniform_page_size(kv_cache_specs)
         assert group_size > 0, "group_size must be greater than 0"
@@ -1061,14 +1086,23 @@ def get_kv_cache_config_from_groups(
             vllm_config, group_size, available_memory, page_size
         )
         kv_cache_tensors = []
-        for i in range(group_size):
-            shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
+        if head_grouped:
+            # Single contiguous tensor; each attention layer resolves its
+            # slice through the block_table's flat group index
+            # (layer_idx × num_head_groups + group_in_layer).
+            shared_by = list(kv_cache_groups[0].layer_names)
             kv_cache_tensors.append(
                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
             )
+        else:
+            for i in range(group_size):
+                shared_by = []
+                for j in range(len(kv_cache_groups)):
+                    if i < len(kv_cache_groups[j].layer_names):
+                        shared_by.append(kv_cache_groups[j].layer_names[i])
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                )
 
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -1213,10 +1247,21 @@ def _report_kv_cache_config(
         [group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups]
     )
 
+    # Head-grouped paging: 1 token consumes (num_layers × num_head_groups) slots.
+    spec0 = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    if isinstance(spec0, HeadGroupedAttentionSpec):
+        num_layers_total = sum(
+            len(g.layer_names) for g in kv_cache_config.kv_cache_groups
+        )
+        token_slot_multiplier = num_layers_total * spec0.num_head_groups_per_layer
+    else:
+        token_slot_multiplier = 1
+
     # Log the KV cache size and maximum concurrency.
     num_tokens = (
         kv_cache_config.num_blocks
         // len(kv_cache_config.kv_cache_groups)
+        // token_slot_multiplier
         * min_block_size
     )
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
