@@ -67,9 +67,12 @@ auto-set when these features are on. Compression sizing
 ## Supported Models
 
 - Qwen3-4B
-- Qwen2.5-7B
+- Qwen2.5-7B (Remove DCA Config on config.json)
 - Qwen3-32B
 - Llama-3.1-8B-Instruct
+
+# Supported Attention Backend
+- FlashAttention
 
 Test a completion:
 
