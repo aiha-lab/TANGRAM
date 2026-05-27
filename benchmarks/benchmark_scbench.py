@@ -9,13 +9,13 @@ a single conversation through vLLM's multi-turn auto-advance path; turn 0
 is a prefill-only context turn (one output token, discarded), turn 1 emits
 the answer used for evaluation.
 
-The script depends on FastKVZip's prefill package for SCBench data loading,
-per-model prompt templates, and answer evaluation. Set ``FASTKVZIP_PATH``
-to point to ``<FastKVzip>/prefill`` if it is not at the default location.
+SCBench data loading, per-model prompt templates, generation-length presets,
+and answer metrics are provided self-contained by ``scbench_local`` (a sibling
+module in this directory), so no external FastKVZip checkout is required.
 
 Example:
     python benchmark_scbench.py -d scbench_kv --num 100 --ratio 0.3 \\
-        -m /raid/LLM/Qwen2.5-7B-Instruct-1M --max-model-len 200000 \\
+        -m Qwen/Qwen2.5-7B-Instruct-1M --max-model-len 200000 \\
         --single-turn --force-exact-tokens --max-tokens 512
 """
 
@@ -30,22 +30,18 @@ from typing import Any
 import numpy as np
 from transformers import AutoTokenizer
 
-# FastKVZip provides the SCBench loader, template, and evaluator. Inject its
-# prefill directory onto sys.path before importing from it.
-_FASTKVZIP_DEFAULT = "/workspace/FastKVzip/prefill"
-_FASTKVZIP_PATH = os.environ.get("FASTKVZIP_PATH", _FASTKVZIP_DEFAULT)
-if not os.path.isdir(_FASTKVZIP_PATH):
-    raise RuntimeError(
-        f"FastKVZip prefill directory not found at {_FASTKVZIP_PATH!r}. "
-        "Set FASTKVZIP_PATH to '<FastKVzip-repo>/prefill'."
-    )
-sys.path.insert(0, _FASTKVZIP_PATH)
+# Self-contained SCBench helpers (formerly FastKVZip's prefill package). Ensure
+# this script's directory is importable when invoked from elsewhere.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from data.load import load_dataset_all  # noqa: E402
-from eval import get_data_list  # noqa: E402
-from model.template import template  # noqa: E402
-from results.metric import evaluate_answer, f1_score  # noqa: E402
-from utils.func import set_gen_length  # noqa: E402
+from scbench_local import (  # noqa: E402
+    evaluate_answer,
+    f1_score,
+    get_data_list,
+    load_dataset_all,
+    set_gen_length,
+    template,
+)
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
@@ -568,8 +564,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-path", "-m",
         type=str,
-        default="/raid/LLM/Qwen2.5-7B-Instruct-1M",
-        help="Path to the model checkpoint.",
+        default="Qwen/Qwen2.5-7B-Instruct-1M",
+        help="Model checkpoint path or HF model ID.",
     )
     parser.add_argument("--max-model-len", type=int, default=40960)
     parser.add_argument(
@@ -602,7 +598,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=str, required=True,
         help=(
             "Dataset name or group (e.g. scbench_kv, scbench_many_shot, squad, "
-            "gsm, short, mid, long, all). See FastKVZip/prefill/eval.py."
+            "gsm, short, mid, long, all). See scbench_local.get_data_list."
         ),
     )
     parser.add_argument(
