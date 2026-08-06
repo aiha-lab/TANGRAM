@@ -20,6 +20,13 @@ Tangram: Unlocking Non-Uniform KV Cache Compression for Efficient Multi-turn LLM
   <img src="docs/assets/speedup/speedup.png" alt="Tangram end-to-end speedup vs vLLM 0.11.1" width="100%"/>
 </p>
 
+<details>
+<summary><b>Speedup Result(KeyDiff)</b></summary>
+<p align="center">
+  <img src="docs/assets/speedup/speedup_keydiff.png" alt="Tangram end-to-end speedup, KeyDiff scorer" width="100%"/>
+</p>
+</details>
+
 **Tangram** is a serving system that makes non-uniform KV cache compression
 practical for multi-turn LLM serving, built on top of
 [vLLM](https://github.com/vllm-project/vllm).
