@@ -196,7 +196,7 @@ bash benchmark_ruler.sh
 - `RATIOS` — KV retention fraction (`1.0` = FullKV reference)
 - `LEVEL` — selection level; see [Configuration](#configuration)
 
-### Speedup
+### How to reproduce speedup
 
 Measure end-to-end generation speedup — wall-clock at `r=1.0` (uncompressed)
 vs compressed ratios on an SCBench task:
