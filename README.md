@@ -104,6 +104,15 @@ The following models have been verified with Tangram. More models are on the way
 
 ## Accuracy
 
+<details>
+<summary><b>Accuracy Comparison(SCBench, Tangram vs PyTorch)</b></summary>
+
+<p align="center">
+  <img src="docs/assets/accuracy/accuracy_scbench.png" alt="SCBench accuracy comparison, Tangram vs PyTorch across four compression methods" width="100%"/>
+</p>
+
+</details>
+
 [RULER](https://arxiv.org/abs/2404.06654) 8K
 
 <details>
