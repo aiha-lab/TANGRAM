@@ -54,3 +54,24 @@ bash benchmark_scbench.sh
 ```
 
 Override `MODEL=` for another model.
+
+### Knobs
+
+`SCORER` (or `SCORERS` in `run_speedup.sh`, which takes a list) picks the importance
+scorer, and **it must be `keydiff` for anything on this page to apply** — the scripts
+otherwise default to `snapkv`, and `run_speedup.sh` to `snapkv fastkvzip`.
+
+`LEVEL` is the *selection level*: the scope a KV budget is shared over, which decides
+whether heads may keep different numbers of tokens.
+
+| `LEVEL` | Budget scope |
+| ------- | ------------ |
+| `uniform` | Every (layer, head group) keeps the same token count; only *which* tokens are kept differs. Needs no cluster map. |
+| `perlayer_cluster` | Each layer gets an equal budget, spread non-uniformly across the heads in that layer. Needs the `_perlayer` cluster map. |
+| `crosslayer_cluster` | One global budget spread across all layers and heads, so an important head in any layer can keep more. Needs the cross-layer cluster map. |
+
+The scripts also accept `perlayer_head` and `crosslayer_head`, which apply the same two
+scopes with a head-calibrated threshold instead of a cluster-calibrated one. KeyDiff
+cluster maps for every verified model already ship under
+[`tools/head_group_clustering/cluster_maps/keydiff/`](../../tools/head_group_clustering/cluster_maps/keydiff),
+so the cluster levels work with no extra step.
