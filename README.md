@@ -38,6 +38,15 @@ practical for multi-turn LLM serving, built on top of
 - **Real memory reclamation** — compressed KV cache is actually freed, turning memory savings into higher serving throughput
 - **Zero runtime scheduling overhead** — budget reservation and ahead-of-time (AOT) load balancing keep compression off the critical path
 
+## Use cases
+
+<details>
+<summary><b>Use cases</b></summary>
+
+- [KeyDiff](docs/usecases/keydiff.md)
+
+</details>
+
 ## Installation
 
 ```bash
@@ -101,15 +110,6 @@ The following models have been verified with Tangram. More models are on the way
 | Qwen3-30B-A3B (MoE)&nbsp;* | [`Qwen/Qwen3-30B-A3B-Instruct-2507`](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) |
 
 \* Verified with `tensor_parallel_size=2`.
-
-## Use cases
-
-<details>
-<summary><b>Use cases</b></summary>
-
-- [KeyDiff](docs/usecases/keydiff.md)
-
-</details>
 
 ## Accuracy
 
