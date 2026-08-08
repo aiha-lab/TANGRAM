@@ -102,6 +102,15 @@ The following models have been verified with Tangram. More models are on the way
 
 \* Verified with `tensor_parallel_size=2`.
 
+## Use cases
+
+<details>
+<summary><b>Use cases</b></summary>
+
+- [KeyDiff](docs/usecases/keydiff.md)
+
+</details>
+
 ## Accuracy
 
 <details>
