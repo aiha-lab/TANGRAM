@@ -22,20 +22,6 @@ state across chunks).
 The `[num_kv_heads, chunk_len]` score it returns is the contract every Tangram scorer
 shares, so `compression_level` stays an orthogonal knob.
 
-## Speedup
-
-<p align="center">
-  <img src="../assets/speedup/speedup_keydiff.png" alt="Tangram end-to-end speedup, KeyDiff scorer" width="100%"/>
-</p>
-
-## Accuracy
-
-KeyDiff is the second column.
-
-<p align="center">
-  <img src="../assets/accuracy/accuracy_scbench.png" alt="SCBench accuracy comparison, Tangram vs PyTorch across four compression methods" width="100%"/>
-</p>
-
 ## How to run
 
 Speedup:
@@ -53,7 +39,8 @@ SCORER=keydiff LEVEL=perlayer_cluster DATASET=mid RATIOS="1.0 0.5 0.25 0.1" \
 bash benchmark_scbench.sh
 ```
 
-Override `MODEL=` for another model.
+Override `MODEL=` for another model, and `DATASET=` for another task group
+(`short` / `mid` / `long` / `multi`).
 
 ### Knobs
 
@@ -75,3 +62,25 @@ scopes with a head-calibrated threshold instead of a cluster-calibrated one. Key
 cluster maps for every verified model already ship under
 [`tools/head_group_clustering/cluster_maps/keydiff/`](../../tools/head_group_clustering/cluster_maps/keydiff),
 so the cluster levels work with no extra step.
+
+## Speedup
+
+<p align="center">
+  <img src="../assets/speedup/speedup_keydiff.png" alt="Tangram end-to-end speedup, KeyDiff scorer" width="100%"/>
+</p>
+
+## Accuracy
+
+Every point below is the mean over **all 13 SCBench datasets** — the whole benchmark,
+across its `short`, `mid`, `long` and `multi` task groups — not a single task and not one
+group. The `DATASET=mid` command above runs one group, so reproducing a bar means
+sweeping all four and averaging over the datasets they cover.
+
+Five models, KeyDiff scorer, w/ against w/o Tangram at each retention ratio. The dashed
+line is the full-KV reference (itself per-method, since a scorer's observation window
+applies even at full budget) and the violet series is the gap between the two bars, as a
+percentage of the w/o-Tangram score, on the right axis.
+
+<p align="center">
+  <img src="../assets/accuracy/accuracy_scbench_keydiff.png" alt="SCBench accuracy, KeyDiff scorer, Tangram vs PyTorch across five models" width="100%"/>
+</p>
