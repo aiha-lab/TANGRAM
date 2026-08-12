@@ -31,17 +31,21 @@ Tangram: Unlocking Non-Uniform KV Cache Compression for Efficient Multi-turn LLM
 practical for multi-turn LLM serving, built on top of
 [vLLM](https://github.com/vllm-project/vllm).
 
-**Highlights**
+## 📰 Updates
 
-- **KV Cache Compression on vLLM with Ragged Paging** — non-uniform and uniform KV cache compression, natively integrated into vLLM
-- **Seamless vLLM integration** — fully compatible with paged attention, continuous batching, chunked prefill, and CUDA graph mode
-- **Real memory reclamation** — compressed KV cache is actually freed, turning memory savings into higher serving throughput
-- **Zero runtime scheduling overhead** — budget reservation and ahead-of-time (AOT) load balancing keep compression off the critical path
+- **[2026/08/12]** 📚 Tutorials updated with the **KeyDiff** algorithm — see the [KeyDiff use case](docs/usecases/keydiff.md).
+
+## ✨ Highlights
+
+- 🧩 **Ragged Paging for efficient KV compression** — non-uniform *and* uniform KV cache compression, natively integrated into vLLM
+- 🔌 **Seamless vLLM integration** — fully compatible with paged attention, continuous batching, chunked prefill, and CUDA graph mode
+- 💾 **Real memory reclamation** — compressed KV cache is actually freed, turning memory savings into higher serving throughput
+- ⚡ **Zero runtime scheduling overhead** — budget reservation and ahead-of-time (AOT) load balancing keep compression off the critical path
 
 ## Use cases
 
 <details>
-<summary><b>Use cases</b></summary>
+<summary><b>Bring your own compression algorithm</b></summary>
 
 - [KeyDiff](docs/usecases/keydiff.md)
 
